@@ -1,0 +1,7 @@
+{
+  "name": "lattice-ts-parser",
+  "private": true,
+  "dependencies": {
+    "ts-morph": "^27.0.0"
+  }
+}
