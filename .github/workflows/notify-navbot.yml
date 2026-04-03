@@ -1,0 +1,17 @@
+name: Notify NavBot
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger NavBot subtree pull
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.NAVBOT_DISPATCH_TOKEN }}
+          repository: navindasg/NavBot
+          event-type: lattice-updated
+          client-payload: '{"ref": "${{ github.sha }}"}'
