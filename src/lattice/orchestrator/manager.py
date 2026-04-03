@@ -362,6 +362,30 @@ class ProcessManager:
         )
         return instance, proc
 
+    @property
+    def mapper_processes(self) -> dict[str, asyncio.subprocess.Process]:
+        """Live reference to mapper subprocess registry keyed by project_root.
+
+        Returns the internal dict directly so consumers (IntentRouter,
+        VoicePipeline) always see the current state without needing to
+        re-query after respawns.
+        """
+        return self._mapper_processes
+
+    @property
+    def instance_ids(self) -> list[str]:
+        """Return IDs of all managed instances."""
+        return list(self._instances.keys())
+
+    def instance_id_for_process(
+        self, proc: asyncio.subprocess.Process
+    ) -> str | None:
+        """Return the instance ID that owns the given subprocess, or None."""
+        for iid, p in self._processes.items():
+            if p is proc:
+                return iid
+        return None
+
     def get_instance(self, instance_id: str) -> ManagedInstance | None:
         """Return the in-memory instance by ID.
 

@@ -1197,8 +1197,19 @@ def orchestrator_status(instance_id: str | None, db_path: str, as_json: bool) ->
     show_default=True,
     help="Path to orchestrator DuckDB.",
 )
+@click.option(
+    "--project",
+    "project_root",
+    default=None,
+    help="Project root to wire live mapper subprocess for NDJSON dispatch.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output structured JSON envelope.")
-def orchestrator_voice(text_input: str | None, db_path: str, as_json: bool) -> None:
+def orchestrator_voice(
+    text_input: str | None,
+    db_path: str,
+    project_root: str | None,
+    as_json: bool,
+) -> None:
     """Start voice listener or process text input through intent router.
 
     Without --text, starts push-to-talk voice listener (requires microphone and
@@ -1207,13 +1218,15 @@ def orchestrator_voice(text_input: str | None, db_path: str, as_json: bool) -> N
     With --text, processes the given text through the same intent classification
     and routing pipeline — useful for testing, scripting, or when microphone is unavailable.
 
+    With --project, spawns a live mapper subprocess via ProcessManager so voice
+    commands route to actual NDJSON I/O instead of returning a CLI fallback.
+
     Examples::
 
         lattice orchestrator:voice
         lattice orchestrator:voice --text "map the auth directory"
-        lattice orchestrator:voice --text "what's the status" --json
+        lattice orchestrator:voice --text "map status" --project /path/to/project --json
     """
-    from lattice.orchestrator.voice.intent import IntentClassifier
     from lattice.orchestrator.voice.models import VoiceConfig
     from lattice.orchestrator.voice.pipeline import VoicePipeline, format_voice_display
     from lattice.orchestrator.voice.router import IntentRouter
@@ -1226,36 +1239,65 @@ def orchestrator_voice(text_input: str | None, db_path: str, as_json: bool) -> N
     except Exception:
         voice_config = VoiceConfig()
 
-    # Set up router with optional DB connection
-    db_conn = None
-    db_file = Path(db_path)
-    if db_file.exists():
-        db_conn = duckdb.connect(str(db_file), read_only=True)
+    async def _run_voice() -> None:
+        """Run the full voice pipeline in a single event loop."""
+        from lattice.orchestrator.manager import ProcessManager
+        from lattice.orchestrator.models import OrchestratorConfig
 
-    try:
-        router = IntentRouter(db_conn=db_conn)
-        pipeline = VoicePipeline(config=voice_config, router=router)
+        db_conn: duckdb.DuckDBPyConnection | None = None
+        db_file = Path(db_path)
+        manager: ProcessManager | None = None
+        mapper_procs: dict[str, asyncio.subprocess.Process] = {}
 
-        if text_input is not None:
-            # Text fallback mode: process typed text through intent pipeline
-            result = pipeline.process_text(text_input)
-            if as_json:
-                click.echo(json.dumps(success_response("orchestrator:voice", {
-                    "transcript": text_input,
-                    "action": result.action,
-                    "success": result.success,
-                    "detail": result.detail,
-                    "data": result.data,
-                })))
-            else:
-                click.echo(format_voice_display(text_input, result))
-            return
+        try:
+            if project_root is not None:
+                # Single rw connection shared by ProcessManager and IntentRouter
+                db_file.parent.mkdir(parents=True, exist_ok=True)
+                db_conn = duckdb.connect(str(db_file))
+                manager = ProcessManager(db_conn, OrchestratorConfig())
+                await manager.spawn_mapper(str(Path(project_root).resolve()))
+                mapper_procs = manager.mapper_processes
+            elif db_file.exists():
+                db_conn = duckdb.connect(str(db_file), read_only=True)
 
-        # Voice listener mode: start push-to-talk loop
-        asyncio.run(pipeline.run_listener())
-    finally:
-        if db_conn is not None:
-            db_conn.close()
+            router = IntentRouter(
+                db_conn=db_conn,
+                mapper_processes=mapper_procs or None,
+            )
+            pipeline = VoicePipeline(
+                config=voice_config,
+                router=router,
+                mapper_processes=mapper_procs or None,
+            )
+
+            if text_input is not None:
+                if mapper_procs:
+                    result = await pipeline.process_text_async(text_input)
+                else:
+                    result = pipeline.process_text(text_input)
+                if as_json:
+                    click.echo(json.dumps(success_response("orchestrator:voice", {
+                        "transcript": text_input,
+                        "action": result.action,
+                        "success": result.success,
+                        "detail": result.detail,
+                        "data": result.data,
+                    })))
+                else:
+                    click.echo(format_voice_display(text_input, result))
+                return
+
+            # Voice listener mode: start push-to-talk loop
+            await pipeline.run_listener()
+        finally:
+            if manager is not None:
+                from lattice.orchestrator.manager import terminate_instance
+                for proc in manager.mapper_processes.values():
+                    await terminate_instance(proc, timeout=5.0)
+            if db_conn is not None:
+                db_conn.close()
+
+    asyncio.run(_run_voice())
 
 
 # ---------------------------------------------------------------------------
@@ -1272,26 +1314,33 @@ def orchestrator_voice(text_input: str | None, db_path: str, as_json: bool) -> N
     show_default=True,
     help="Path to project config YAML.",
 )
+@click.option(
+    "--no-voice",
+    "no_voice",
+    is_flag=True,
+    help="Disable voice listener (run only process manager and mapper).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output structured JSON envelope.")
-def orchestrator_start(project: str, config_path: str, as_json: bool) -> None:
+def orchestrator_start(project: str, config_path: str, no_voice: bool, as_json: bool) -> None:
     """Configure and start an orchestrator for a named project.
 
     Loads the project configuration from CONFIG_PATH, validates the ProjectConfig
-    model, and creates the required .lattice/ directory structure for the named
-    project.
+    model, creates the required .lattice/ directory structure, then starts the
+    async orchestrator event loop with ProcessManager, Mapper subprocess, and
+    (optionally) VoicePipeline.
 
-    The CLI validates config and creates the directory structure. The actual async
-    orchestrator event loop (spawning Mapper subprocess and CC instances) is
-    initiated by the process manager and is not directly started here.
+    The event loop keeps all subprocesses alive and handles graceful shutdown
+    on SIGTERM/SIGINT.
 
     Examples::
 
         lattice orchestrator:start --project my-project
-        lattice orchestrator:start --project my-project --config /path/to/config.yaml
+        lattice orchestrator:start --project my-project --no-voice
         lattice orchestrator:start --project my-project --json
     """
     import yaml
     from lattice.llm.config import ProjectConfig
+    from lattice.orchestrator.runner import OrchestratorRunner
 
     config_file = Path(config_path)
 
@@ -1348,12 +1397,32 @@ def orchestrator_start(project: str, config_path: str, as_json: bool) -> None:
     souls_dir = lattice_dir / "souls"
     souls_dir.mkdir(parents=True, exist_ok=True)
 
+    db_path = str(lattice_dir / "orchestrator.duckdb")
+
+    # Load voice config
+    try:
+        from lattice.llm.config import LatticeSettings
+        voice_config_obj = LatticeSettings().voice
+    except Exception:
+        from lattice.orchestrator.voice.models import VoiceConfig
+        voice_config_obj = VoiceConfig()
+
+    runner = OrchestratorRunner(
+        project_root=str(root),
+        db_path=db_path,
+        voice_config=voice_config_obj,
+        voice_enabled=not no_voice,
+    )
+
     if as_json:
         click.echo(json.dumps(success_response("orchestrator:start", {
             "project": project,
             "root": str(root),
-            "status": "configured",
+            "status": "starting",
             "lattice_dir": str(lattice_dir),
+            "voice_enabled": not no_voice,
         })))
     else:
-        click.echo(f"Orchestrator started for project: {project} at {root}")
+        click.echo(f"Orchestrator starting for project: {project} at {root}")
+
+    asyncio.run(runner.run())

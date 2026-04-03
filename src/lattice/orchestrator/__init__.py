@@ -24,6 +24,7 @@ from lattice.orchestrator.manager import (
     is_process_alive,
     terminate_instance,
 )
+from lattice.orchestrator.runner import OrchestratorRunner
 from lattice.orchestrator.models import (
     BreakerConfig,
     CircuitBreakerState,
@@ -61,6 +62,7 @@ __all__ = [
     "CircuitBreaker",
     "ContextManagerConfig",
     "OrchestratorConfig",
+    "OrchestratorRunner",
     "TaskRecord",
     "ProcessManager",
     "ProcessRegistry",

@@ -401,6 +401,42 @@ class TestSpawnMapper:
         assert hasattr(manager, "_mapper_processes")
         assert isinstance(manager._mapper_processes, dict)
 
+    def test_mapper_processes_property_returns_live_dict(self):
+        """mapper_processes property returns the live internal dict."""
+        conn = duckdb.connect(":memory:")
+        config = OrchestratorConfig()
+        manager = ProcessManager(conn, config)
+        result = manager.mapper_processes
+        assert isinstance(result, dict)
+        assert len(result) == 0
+        # Returns the same object (live reference for router/pipeline wiring)
+        assert result is manager.mapper_processes
+
+    def test_instance_ids_property(self):
+        """instance_ids property returns list of managed instance IDs."""
+        conn = duckdb.connect(":memory:")
+        config = OrchestratorConfig()
+        manager = ProcessManager(conn, config)
+        assert manager.instance_ids == []
+
+    @pytest.mark.asyncio
+    async def test_mapper_processes_property_populated_after_spawn(self, tmp_path):
+        """mapper_processes property reflects spawned mapper subprocess."""
+        conn = duckdb.connect(":memory:")
+        config = OrchestratorConfig()
+        manager = ProcessManager(conn, config)
+
+        project_root = str(tmp_path)
+        stub = [sys.executable, "-c", "import time; time.sleep(60)"]
+        _, proc = await manager.spawn_mapper(project_root, cmd=stub)
+        try:
+            procs = manager.mapper_processes
+            assert project_root in procs
+            assert procs[project_root].pid == proc.pid
+        finally:
+            proc.terminate()
+            await proc.wait()
+
 
 # ---------------------------------------------------------------------------
 # build_child_env project vars (Task 1 additions)
