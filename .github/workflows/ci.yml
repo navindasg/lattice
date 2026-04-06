@@ -22,11 +22,20 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
       - name: Install dependencies
         run: uv sync
 
       - name: Run tests
-        run: uv run pytest --tb=short -q
+        env:
+          DISPLAY: ":99"
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 1
+          uv run pytest --tb=short -q
 
       - name: Type check (pyright)
         run: |
