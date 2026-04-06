@@ -23,12 +23,16 @@ import click
 import numpy as np
 import structlog
 
+from typing import TYPE_CHECKING
+
 from lattice.orchestrator.protocol import read_message, write_message
-from lattice.orchestrator.voice.capture import AudioCapture
 from lattice.orchestrator.voice.intent import IntentClassifier
-from lattice.orchestrator.voice.hotkey import HotkeyListener
 from lattice.orchestrator.voice.models import VoiceConfig
 from lattice.orchestrator.voice.router import IntentRouter, RouteResult
+
+if TYPE_CHECKING:
+    from lattice.orchestrator.voice.capture import AudioCapture
+    from lattice.orchestrator.voice.hotkey import HotkeyListener
 
 log = structlog.get_logger(__name__)
 
@@ -146,8 +150,10 @@ class VoicePipeline:
             RouteResult from IntentRouter.dispatch, or empty_transcript result
             if STT produces no speech.
         """
+        from lattice.orchestrator.voice.capture import AudioCapture as _AudioCapture
+
         stt = self._ensure_stt()
-        capture = AudioCapture()
+        capture = _AudioCapture()
         wav_bytes = capture.to_wav_bytes(audio_np)
         transcript = stt.transcribe_with_fallback(
             audio_np, wav_bytes, self._config.confidence_threshold
@@ -264,11 +270,14 @@ class VoicePipeline:
         Calls beep_start on hotkey press (recording begins) and beep_stop on
         release (recording ends, processing starts).
         """
+        from lattice.orchestrator.voice.capture import AudioCapture as _AudioCapture
+        from lattice.orchestrator.voice.hotkey import HotkeyListener as _HotkeyListener
+
         loop = asyncio.get_running_loop()
-        hotkey = HotkeyListener(self._config.hotkey, loop)
+        hotkey = _HotkeyListener(self._config.hotkey, loop)
         hotkey.start()
         self._log.info("voice_listener_started", hotkey=self._config.hotkey)
-        capture = AudioCapture()
+        capture = _AudioCapture()
 
         try:
             async for event in hotkey.events():
