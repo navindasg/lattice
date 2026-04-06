@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pynput = pytest.importorskip("pynput", reason="pynput requires a display server")
+
 from lattice.orchestrator.voice.hotkey import HotkeyListener
 
 

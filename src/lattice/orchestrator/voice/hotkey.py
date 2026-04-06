@@ -9,12 +9,24 @@ See RESEARCH.md Pattern 1 and Pitfalls 1, 5 for macOS hotkey limitations.
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import structlog
-from pynput import keyboard
 
 logger = structlog.get_logger(__name__)
+
+# Lazy-load pynput to avoid ImportError in headless environments (CI,
+# containers) that lack an X server or display. The module-level name
+# is set on first access so existing patch targets keep working.
+keyboard: object | None = None
+
+
+def _ensure_keyboard():  # noqa: ANN202
+    global keyboard  # noqa: PLW0603
+    if keyboard is None:
+        from pynput import keyboard as _kb
+        keyboard = _kb
+    return keyboard
 
 
 class HotkeyListener:
@@ -32,6 +44,7 @@ class HotkeyListener:
     """
 
     def __init__(self, hotkey_str: str, loop: asyncio.AbstractEventLoop) -> None:
+        _ensure_keyboard()
         self._hotkey_str = hotkey_str
         self._loop = loop
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -45,12 +58,13 @@ class HotkeyListener:
         keyboard.Key enum. Falls back to keyboard.KeyCode.from_char() for
         single character keys or unknown names.
         """
+        kb = _ensure_keyboard()
         # Strip angle brackets: "<f13>" → "f13"
         key_name = hotkey_str.strip("<>")
         try:
-            return getattr(keyboard.Key, key_name)
+            return getattr(kb.Key, key_name)
         except AttributeError:
-            return keyboard.KeyCode.from_char(key_name[0] if key_name else hotkey_str[0])
+            return kb.KeyCode.from_char(key_name[0] if key_name else hotkey_str[0])
 
     def _matches_hotkey(self, key: keyboard.Key | keyboard.KeyCode | None) -> bool:
         """Return True if key matches the configured target key."""
@@ -72,7 +86,8 @@ class HotkeyListener:
         Note: pynput Listener.stop() permanently terminates the listener.
         Call start() to create a fresh listener; never restart a stopped one.
         """
-        self._listener = keyboard.Listener(
+        kb = _ensure_keyboard()
+        self._listener = kb.Listener(
             on_press=self._on_press,
             on_release=self._on_release,
             daemon=True,
