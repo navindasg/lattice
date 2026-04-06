@@ -115,6 +115,8 @@ class PromptBuilder:
                                   Returns 0 if directory not found.
         """
         dir_path = Path(directory)
+        if not dir_path.is_absolute() and project_root:
+            dir_path = Path(project_root) / dir_path
 
         if not dir_path.exists() or not dir_path.is_dir():
             return [], 0

@@ -10,6 +10,7 @@ Design decisions:
 - Edge betweenness centrality (normalized) used to rank coverage gaps
 - Entry-point count per gap edge: how many entry points can reach the edge's source
 - Serialized output includes metadata with coverage percentage
+- Per-test edge mapping preserved in integration_graph for traceability
 """
 from __future__ import annotations
 
@@ -18,7 +19,12 @@ from pathlib import Path
 
 import networkx as nx
 
-from lattice.models.coverage import GapEntry, TestCoverage, TestFile
+from lattice.models.coverage import (
+    GapEntry,
+    TestCoverage,
+    TestEdgeMapping,
+    TestFile,
+)
 
 # Test types that contribute to edge coverage
 _COVERAGE_TEST_TYPES: frozenset[str] = frozenset({"integration", "e2e"})
@@ -49,9 +55,8 @@ class CoverageBuilder:
         Only integration and e2e tests contribute to edge coverage. Unit tests
         are explicitly excluded.
 
-        For each qualifying test file, each source_module is treated as a
-        starting node. All edges reachable from that node (including itself)
-        via transitive closure are added to the covered set.
+        This is a convenience wrapper around :meth:`compute_covered_edges_per_test`
+        that returns only the flat union without per-test mappings.
 
         Args:
             test_files: Classified test files (from TestClassifier).
@@ -59,27 +64,58 @@ class CoverageBuilder:
         Returns:
             Set of (source, target) edge tuples that are covered.
         """
-        covered: set[tuple[str, str]] = set()
+        covered, _ = self.compute_covered_edges_per_test(test_files)
+        return covered
+
+    def compute_covered_edges_per_test(
+        self, test_files: list[TestFile]
+    ) -> tuple[set[tuple[str, str]], list[TestEdgeMapping]]:
+        """Compute per-test edge coverage and the flat union of all covered edges.
+
+        Returns both the flat union (for gap analysis) and per-test mappings
+        (for the integration graph). This avoids computing transitive closures
+        twice.
+
+        Args:
+            test_files: Classified test files (from TestClassifier).
+
+        Returns:
+            Tuple of (flat_covered_edges, per_test_mappings).
+        """
+        all_covered: set[tuple[str, str]] = set()
+        mappings: list[TestEdgeMapping] = []
 
         qualifying = [
             tf for tf in test_files if tf.test_type in _COVERAGE_TEST_TYPES
         ]
 
         for test_file in qualifying:
+            test_covered: set[tuple[str, str]] = set()
+            reachable_nodes: set[str] = set()
+
             for module in test_file.source_modules:
                 if module not in self._graph:
-                    # Module not in graph — skip gracefully
                     continue
 
-                # Compute transitive closure: all nodes reachable from module
                 reachable = nx.descendants(self._graph, module) | {module}
+                reachable_nodes.update(reachable)
+                test_covered.update(self._graph.subgraph(reachable).edges())
 
-                # Collect all edges in the induced subgraph
-                for source, target in self._graph.edges():
-                    if source in reachable:
-                        covered.add((source, target))
+            if test_covered:
+                mappings.append(
+                    TestEdgeMapping(
+                        test_path=test_file.path,
+                        covered_edges=sorted(
+                            [{"source": s, "target": t} for s, t in test_covered],
+                            key=lambda e: (e["source"], e["target"]),
+                        ),
+                        covered_node_count=len(reachable_nodes),
+                    )
+                )
 
-        return covered
+            all_covered.update(test_covered)
+
+        return all_covered, mappings
 
     def compute_gap_report(
         self,
@@ -109,27 +145,28 @@ class CoverageBuilder:
         if not uncovered:
             return []
 
-        # Compute edge betweenness centrality for the full graph
         centrality_map: dict[tuple[str, str], float] = (
             nx.edge_betweenness_centrality(self._graph, normalized=True)
         )
 
-        # Find all entry point nodes
+        # Pre-compute reachable sets from each entry point once
         entry_points = [
             node
             for node, data in self._graph.nodes(data=True)
             if data.get("is_entry_point", False)
         ]
+        ep_reachable: dict[str, frozenset[str]] = {}
+        for ep in entry_points:
+            ep_reachable[ep] = frozenset(nx.descendants(self._graph, ep) | {ep})
 
         gaps: list[GapEntry] = []
         for source, target in uncovered:
             centrality = centrality_map.get((source, target), 0.0)
 
-            # Count how many entry points can reach the edge's source
             entry_point_count = sum(
                 1
                 for ep in entry_points
-                if ep == source or nx.has_path(self._graph, ep, source)
+                if source in ep_reachable[ep]
             )
 
             annotation = (
@@ -146,7 +183,6 @@ class CoverageBuilder:
                 )
             )
 
-        # Sort by centrality descending, then source/target alphabetically for stability
         gaps.sort(key=lambda g: (-g.centrality, g.source, g.target))
 
         return gaps[:top_n]
@@ -158,16 +194,20 @@ class CoverageBuilder:
     ) -> TestCoverage:
         """Build a complete TestCoverage report.
 
-        Orchestrates compute_covered_edges → compute_gap_report → TestCoverage.
+        Orchestrates: discover per-test mappings, compute flat coverage,
+        run gap analysis, and assemble the final report.
 
         Args:
             test_files: Classified test files.
             top_n: Maximum number of gaps to include in the report.
 
         Returns:
-            TestCoverage with test_files, covered_edges, and gaps populated.
+            TestCoverage with test_files, covered_edges, integration_graph,
+            total_edge_count, and gaps populated.
         """
-        covered_edge_tuples = self.compute_covered_edges(test_files)
+        covered_edge_tuples, integration_graph = (
+            self.compute_covered_edges_per_test(test_files)
+        )
 
         covered_edges_dicts = [
             {"source": src, "target": tgt}
@@ -178,7 +218,9 @@ class CoverageBuilder:
 
         return TestCoverage(
             test_files=test_files,
+            total_edge_count=self._graph.number_of_edges(),
             covered_edges=covered_edges_dicts,
+            integration_graph=integration_graph,
             gaps=gaps,
         )
 
@@ -197,6 +239,7 @@ class CoverageBuilder:
                     "coverage_pct": <float>
                 },
                 "test_files": [<TestFile.model_dump()>, ...],
+                "integration_graph": [<TestEdgeMapping.model_dump()>, ...],
                 "covered_edges": [{"source": ..., "target": ...}, ...],
                 "gaps": [<GapEntry.model_dump()>, ...]
             }
@@ -209,9 +252,9 @@ class CoverageBuilder:
         """
         analyzed_at = datetime.now(timezone.utc).isoformat()
 
-        total = len(coverage.covered_edges) + len(coverage.gaps)
+        total = coverage.total_edge_count
         covered_count = len(coverage.covered_edges)
-        uncovered_count = len(coverage.gaps)
+        uncovered_count = total - covered_count
         coverage_pct = (covered_count / total * 100.0) if total > 0 else 0.0
 
         return {
@@ -223,6 +266,9 @@ class CoverageBuilder:
                 "coverage_pct": coverage_pct,
             },
             "test_files": [tf.model_dump() for tf in coverage.test_files],
+            "integration_graph": [
+                m.model_dump() for m in coverage.integration_graph
+            ],
             "covered_edges": list(coverage.covered_edges),
             "gaps": [g.model_dump() for g in coverage.gaps],
         }

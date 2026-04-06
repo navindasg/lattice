@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from typing import Any, Callable, Awaitable
 
@@ -95,6 +96,28 @@ async def _dispatch_loop(
         write_fn(encoded)
 
 
+def _configure_stderr_logging() -> None:
+    """Redirect structlog output to stderr so stdout stays clean for NDJSON.
+
+    PrintLoggerFactory defaults to stdout, which pollutes the NDJSON data
+    channel when the stdio server runs as a subprocess. This reconfigures
+    structlog to use stderr instead.
+    """
+    import structlog as _structlog
+    import structlog.processors
+    _structlog.configure(
+        processors=[
+            _structlog.processors.add_log_level,
+            _structlog.processors.TimeStamper(fmt="iso"),
+            _structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=_structlog.make_filtering_bound_logger(logging.INFO),
+        context_class=dict,
+        logger_factory=_structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=False,
+    )
+
+
 async def run_stdio_server() -> None:
     """Run the NDJSON stdin->HANDLERS->stdout dispatch loop.
 
@@ -103,6 +126,7 @@ async def run_stdio_server() -> None:
 
     Runs until stdin is closed (EOF) or the process receives a signal.
     """
+    _configure_stderr_logging()
     loop = asyncio.get_running_loop()
 
     # --- Set up async stdin reader ---

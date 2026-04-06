@@ -4,23 +4,31 @@ TDD suite covering:
 - compute_covered_edges: transitive closure from integration/e2e tests
 - compute_covered_edges: unit tests excluded
 - compute_covered_edges: modules not in graph are skipped gracefully
+- compute_covered_edges_per_test: per-test edge mapping (integration graph)
 - compute_gap_report: uncovered edges sorted by centrality descending
 - compute_gap_report: annotation format with betweenness and entry-point count
 - compute_gap_report: top_n limits results
 - compute_gap_report: empty list when all edges covered
-- build: returns valid TestCoverage
+- build: returns valid TestCoverage with total_edge_count and integration_graph
 - serialize: returns dict matching _test_coverage.json schema
+- serialize: coverage_pct is accurate even when top_n truncates gaps
 """
 import pytest
 import networkx as nx
 
-from lattice.models.coverage import GapEntry, TestCoverage, TestFile
+from lattice.models.coverage import (
+    GapEntry,
+    TestCoverage,
+    TestEdgeMapping,
+    TestFile,
+)
 from lattice.testing.coverage import CoverageBuilder
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def small_graph() -> nx.DiGraph:
@@ -32,9 +40,6 @@ def small_graph() -> nx.DiGraph:
         src_b   --> src_e
         src_d   --> src_e
         src_d   --> src_f
-        src_c   --> src_f
-
-    entry_a is an entry point node.
     """
     g = nx.DiGraph()
     g.add_node("src/entry_a.py", is_entry_point=True, language="python")
@@ -179,6 +184,136 @@ class TestComputeCoveredEdges:
         covered = builder.compute_covered_edges([])
         assert covered == set()
 
+    def test_importing_entry_a_covers_all_six_edges(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """entry_a reaches all nodes, so importing it covers all 6 edges."""
+        tf = _make_test_file(
+            "tests/test_integration.py",
+            "integration",
+            ["src/entry_a.py"],
+        )
+        covered = builder.compute_covered_edges([tf])
+        assert len(covered) == 6
+
+
+# ---------------------------------------------------------------------------
+# compute_covered_edges_per_test (integration graph)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCoveredEdgesPerTest:
+    def test_returns_flat_union_and_mappings(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Returns a tuple of (flat_covered, per_test_mappings)."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        covered, mappings = builder.compute_covered_edges_per_test([tf])
+        assert isinstance(covered, set)
+        assert isinstance(mappings, list)
+        assert len(mappings) == 1
+
+    def test_mapping_has_correct_test_path(
+        self, builder: CoverageBuilder
+    ) -> None:
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        _, mappings = builder.compute_covered_edges_per_test([tf])
+        assert mappings[0].test_path == "tests/test_int.py"
+
+    def test_mapping_covered_edges_match_flat_union(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """With a single test, per-test edges should equal the flat union."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        covered, mappings = builder.compute_covered_edges_per_test([tf])
+        mapping_edges = {
+            (e["source"], e["target"]) for e in mappings[0].covered_edges
+        }
+        assert mapping_edges == covered
+
+    def test_mapping_has_covered_node_count(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """covered_node_count reflects reachable nodes from test imports."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        _, mappings = builder.compute_covered_edges_per_test([tf])
+        # src_b reaches src_c and src_e, plus itself = 3 nodes
+        assert mappings[0].covered_node_count == 3
+
+    def test_unit_tests_excluded_from_mappings(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Unit tests should not produce any mappings."""
+        tf = _make_test_file(
+            "tests/test_unit.py",
+            "unit",
+            ["src/entry_a.py"],
+        )
+        covered, mappings = builder.compute_covered_edges_per_test([tf])
+        assert len(covered) == 0
+        assert len(mappings) == 0
+
+    def test_multiple_tests_produce_separate_mappings(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Each qualifying test gets its own TestEdgeMapping."""
+        tf1 = _make_test_file(
+            "tests/test_int_b.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        tf2 = _make_test_file(
+            "tests/test_int_d.py",
+            "integration",
+            ["src/src_d.py"],
+        )
+        _, mappings = builder.compute_covered_edges_per_test([tf1, tf2])
+        assert len(mappings) == 2
+        paths = {m.test_path for m in mappings}
+        assert paths == {"tests/test_int_b.py", "tests/test_int_d.py"}
+
+    def test_mapping_covered_edges_are_sorted(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Per-test covered edges should be sorted by (source, target)."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/entry_a.py"],
+        )
+        _, mappings = builder.compute_covered_edges_per_test([tf])
+        edges = mappings[0].covered_edges
+        keys = [(e["source"], e["target"]) for e in edges]
+        assert keys == sorted(keys)
+
+    def test_flat_union_matches_compute_covered_edges(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """The flat union from per_test should equal compute_covered_edges."""
+        tfs = [
+            _make_test_file("tests/test_b.py", "integration", ["src/src_b.py"]),
+            _make_test_file("tests/test_d.py", "integration", ["src/src_d.py"]),
+        ]
+        flat_from_per_test, _ = builder.compute_covered_edges_per_test(tfs)
+        flat_direct = builder.compute_covered_edges(tfs)
+        assert flat_from_per_test == flat_direct
+
 
 # ---------------------------------------------------------------------------
 # compute_gap_report
@@ -196,7 +331,7 @@ class TestComputeGapReport:
     def test_gap_report_empty_when_all_edges_covered(
         self, builder: CoverageBuilder, small_graph: nx.DiGraph
     ) -> None:
-        """All edges covered → empty gap list."""
+        """All edges covered -> empty gap list."""
         all_edges = set(small_graph.edges())
         gaps = builder.compute_gap_report(all_edges)
         assert gaps == []
@@ -260,6 +395,14 @@ class TestComputeGapReport:
         gaps = builder.compute_gap_report(set())
         for gap in gaps:
             assert isinstance(gap.centrality, float)
+
+    def test_gap_report_entry_point_count_is_positive_for_reachable_edges(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Edges reachable from entry_a should have entry_point_count >= 1."""
+        gaps = builder.compute_gap_report(set())
+        for gap in gaps:
+            assert "from 1 entry point(s)" in gap.annotation
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +474,46 @@ class TestBuild:
         # entry_a covers all reachable edges from it - which is all 6 edges
         assert len(result.gaps) == 0
 
+    def test_build_populates_total_edge_count(
+        self, builder: CoverageBuilder, small_graph: nx.DiGraph
+    ) -> None:
+        """total_edge_count must reflect the actual graph edge count."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        result = builder.build([tf])
+        assert result.total_edge_count == small_graph.number_of_edges()
+        assert result.total_edge_count == 6
+
+    def test_build_populates_integration_graph(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Build should populate integration_graph with per-test mappings."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        result = builder.build([tf])
+        assert len(result.integration_graph) == 1
+        assert isinstance(result.integration_graph[0], TestEdgeMapping)
+        assert result.integration_graph[0].test_path == "tests/test_int.py"
+
+    def test_build_integration_graph_excludes_unit_tests(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Unit tests should not appear in integration_graph."""
+        tfs = [
+            _make_test_file("tests/test_unit.py", "unit", ["src/entry_a.py"]),
+            _make_test_file("tests/test_int.py", "integration", ["src/src_b.py"]),
+        ]
+        result = builder.build(tfs)
+        ig_paths = {m.test_path for m in result.integration_graph}
+        assert "tests/test_unit.py" not in ig_paths
+        assert "tests/test_int.py" in ig_paths
+
 
 # ---------------------------------------------------------------------------
 # serialize
@@ -393,6 +576,20 @@ class TestSerialize:
         assert "gaps" in result
         assert len(result["gaps"]) == 1
 
+    def test_serialize_has_integration_graph_section(
+        self, builder: CoverageBuilder
+    ) -> None:
+        mapping = TestEdgeMapping(
+            test_path="tests/test_int.py",
+            covered_edges=[{"source": "a.py", "target": "b.py"}],
+            covered_node_count=2,
+        )
+        coverage = TestCoverage(integration_graph=[mapping])
+        result = CoverageBuilder.serialize(coverage)
+        assert "integration_graph" in result
+        assert len(result["integration_graph"]) == 1
+        assert result["integration_graph"][0]["test_path"] == "tests/test_int.py"
+
     def test_serialize_metadata_analyzed_at_is_iso8601(
         self, builder: CoverageBuilder
     ) -> None:
@@ -409,3 +606,59 @@ class TestSerialize:
         coverage = TestCoverage()
         result = CoverageBuilder.serialize(coverage)
         assert isinstance(result["metadata"]["coverage_pct"], float)
+
+    def test_serialize_coverage_pct_accurate_with_top_n_truncation(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """coverage_pct must use total_edge_count, not len(gaps) which is truncated."""
+        # Simulate: 10 total edges, 5 covered, 5 uncovered, but gaps truncated to 2
+        gap1 = GapEntry(
+            source="a.py", target="b.py", centrality=0.9,
+            annotation="betweenness 0.9000, on path from 1 entry point(s)",
+        )
+        gap2 = GapEntry(
+            source="c.py", target="d.py", centrality=0.8,
+            annotation="betweenness 0.8000, on path from 1 entry point(s)",
+        )
+        covered = [
+            {"source": f"s{i}.py", "target": f"t{i}.py"} for i in range(5)
+        ]
+        coverage = TestCoverage(
+            total_edge_count=10,
+            covered_edges=covered,
+            gaps=[gap1, gap2],  # only 2 of 5 uncovered (top_n=2)
+        )
+        result = CoverageBuilder.serialize(coverage)
+        meta = result["metadata"]
+        # total should be 10 (from total_edge_count), not 7 (5 covered + 2 gaps)
+        assert meta["total_edges"] == 10
+        assert meta["covered_edges"] == 5
+        assert meta["uncovered_edges"] == 5
+        assert meta["coverage_pct"] == pytest.approx(50.0)
+
+    def test_serialize_coverage_pct_zero_when_no_edges(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """No edges in graph should produce 0% coverage, not division by zero."""
+        coverage = TestCoverage(total_edge_count=0)
+        result = CoverageBuilder.serialize(coverage)
+        assert result["metadata"]["coverage_pct"] == 0.0
+
+    def test_serialize_full_pipeline(
+        self, builder: CoverageBuilder
+    ) -> None:
+        """Serialize a build() result and verify structural integrity."""
+        tf = _make_test_file(
+            "tests/test_int.py",
+            "integration",
+            ["src/src_b.py"],
+        )
+        coverage = builder.build([tf])
+        result = CoverageBuilder.serialize(coverage)
+
+        meta = result["metadata"]
+        assert meta["total_edges"] == 6
+        assert meta["covered_edges"] + meta["uncovered_edges"] == 6
+        assert 0.0 <= meta["coverage_pct"] <= 100.0
+        assert len(result["integration_graph"]) == 1
+        assert len(result["test_files"]) == 1

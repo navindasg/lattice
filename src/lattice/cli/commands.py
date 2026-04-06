@@ -455,12 +455,6 @@ def map_gaps(target: str, top: int, as_json: bool) -> None:
         return
 
     # Human-readable output
-    # Compute per-type test counts
-    unit_count = sum(1 for tf in test_files if tf.test_type == "unit")
-    integration_count = sum(1 for tf in test_files if tf.test_type == "integration")
-    e2e_count = sum(1 for tf in test_files if tf.test_type == "e2e")
-
-    # Print graph staleness hint (per Pitfall 6)
     graph_mtime = datetime.fromtimestamp(
         graph_path.stat().st_mtime, tz=timezone.utc
     ).isoformat()

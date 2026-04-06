@@ -21,9 +21,11 @@ Available exports:
     TestFile                — discovered and classified test file model
     TestType                — Literal["unit", "integration", "e2e"]
     GapEntry                — untested integration seam ranked by centrality
+    TestEdgeMapping         — per-test mapping of covered dependency edges
     TestCoverage            — complete test coverage report model
     TestDiscovery           — discovers pytest and jest test files
     TestClassifier          — classifies test files by type
+    CoverageBuilder         — computes transitive edge coverage and gap reports
     DirDoc                  — _dir.md shadow tree document model
     ConfidenceSource        — Literal type for confidence source values
     GapSummary              — coverage gap summary nested in DirDoc
@@ -160,10 +162,16 @@ from lattice.graph.entry_points import EntryPointDetector
 from lattice.graph.serializer import serialize_graph
 from lattice.logging import configure_logging
 from lattice.models.analysis import FileAnalysis, GraphNode, ImportInfo
-from lattice.models.coverage import GapEntry, TestCoverage, TestFile, TestType
+from lattice.models.coverage import (
+    GapEntry,
+    TestCoverage,
+    TestEdgeMapping,
+    TestFile,
+    TestType,
+)
 from lattice.models.orchestrator import ManagedInstance, MapperCommand
 from lattice.models.session import MappingSession
-from lattice.testing import TestClassifier, TestDiscovery
+from lattice.testing import CoverageBuilder, TestClassifier, TestDiscovery
 
 __all__ = [
     "FileAnalysis",
@@ -183,9 +191,11 @@ __all__ = [
     "TestFile",
     "TestType",
     "GapEntry",
+    "TestEdgeMapping",
     "TestCoverage",
     "TestDiscovery",
     "TestClassifier",
+    "CoverageBuilder",
     "DirDoc",
     "ConfidenceSource",
     "GapSummary",

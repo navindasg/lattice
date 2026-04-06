@@ -390,6 +390,72 @@ class TestMapGapsCommand:
         )
         assert len(data["gaps"]) <= 2
 
+    # ------------------------------------------------------------------
+    # --json flag
+    # ------------------------------------------------------------------
+
+    def test_json_flag_returns_success_envelope(self, tmp_path: Path) -> None:
+        """--json wraps output in a success envelope with success=True and data."""
+        self._setup_minimal_project(tmp_path)
+        result = self.runner.invoke(
+            cli, ["map:gaps", str(tmp_path), "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        envelope = json.loads(result.output)
+        assert envelope["success"] is True
+        assert "data" in envelope
+
+    def test_json_flag_data_has_all_sections(self, tmp_path: Path) -> None:
+        """--json data payload has metadata, test_files, integration_graph, covered_edges, gaps."""
+        self._setup_minimal_project(tmp_path)
+        result = self.runner.invoke(
+            cli, ["map:gaps", str(tmp_path), "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)["data"]
+        assert "metadata" in data
+        assert "test_files" in data
+        assert "integration_graph" in data
+        assert "covered_edges" in data
+        assert "gaps" in data
+
+    def test_json_flag_error_returns_error_envelope(self, tmp_path: Path) -> None:
+        """--json with missing graph returns error envelope, not ClickException."""
+        result = self.runner.invoke(
+            cli, ["map:gaps", str(tmp_path), "--json"]
+        )
+        assert result.exit_code == 0  # JSON errors don't raise, they return envelope
+        envelope = json.loads(result.output)
+        assert envelope["success"] is False
+        assert envelope["error"]["code"] == "GRAPH_NOT_FOUND"
+
+    # ------------------------------------------------------------------
+    # integration_graph in output
+    # ------------------------------------------------------------------
+
+    def test_output_json_has_integration_graph(self, tmp_path: Path) -> None:
+        """_test_coverage.json must include an integration_graph section."""
+        self._setup_minimal_project(tmp_path)
+        result = self.runner.invoke(cli, ["map:gaps", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(
+            (tmp_path / ".agent-docs" / "_test_coverage.json").read_text()
+        )
+        assert "integration_graph" in data
+
+    def test_output_json_total_edges_matches_graph(self, tmp_path: Path) -> None:
+        """metadata.total_edges must match the actual graph edge count."""
+        self._setup_minimal_project(tmp_path)
+        result = self.runner.invoke(cli, ["map:gaps", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(
+            (tmp_path / ".agent-docs" / "_test_coverage.json").read_text()
+        )
+        meta = data["metadata"]
+        # Minimal project has 1 edge (app -> db)
+        assert meta["total_edges"] == 1
+        assert meta["covered_edges"] + meta["uncovered_edges"] == meta["total_edges"]
+
 
 # ---------------------------------------------------------------------------
 # TestMapCrossCommand
