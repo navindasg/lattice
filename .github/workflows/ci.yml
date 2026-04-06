@@ -23,7 +23,9 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2 xvfb
 
       - name: Install dependencies
         run: uv sync
@@ -32,10 +34,9 @@ jobs:
         env:
           DISPLAY: ":99"
         run: |
-          sudo apt-get install -y xvfb
           Xvfb :99 -screen 0 1024x768x24 &
           sleep 1
-          uv run pytest --tb=long 2>&1 | tee test-output.txt
+          uv run pytest --tb=short -q 2>&1 | tee test-output.txt
 
       - name: Upload test output
         if: failure()
