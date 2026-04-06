@@ -35,7 +35,14 @@ jobs:
           sudo apt-get install -y xvfb
           Xvfb :99 -screen 0 1024x768x24 &
           sleep 1
-          uv run pytest --tb=short -q
+          uv run pytest --tb=long 2>&1 | tee test-output.txt
+
+      - name: Upload test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.txt
 
       - name: Type check (pyright)
         run: |
