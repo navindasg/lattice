@@ -12,11 +12,23 @@ from __future__ import annotations
 import io
 
 import numpy as np
-import sounddevice as sd
 import structlog
 from scipy.io import wavfile
 
 logger = structlog.get_logger(__name__)
+
+# Lazy-load sounddevice to avoid PortAudio OSError in environments
+# without audio hardware (CI, containers). The module-level `sd` name
+# is set on first use so existing patch targets (capture.sd) keep working.
+sd: object | None = None
+
+
+def _ensure_sd():  # noqa: ANN202
+    global sd  # noqa: PLW0603
+    if sd is None:
+        import sounddevice as _sd
+        sd = _sd
+    return sd
 
 
 class AudioCapture:
@@ -37,7 +49,7 @@ class AudioCapture:
 
     def __init__(self) -> None:
         self._frames: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
+        self._stream: object | None = None
 
     def start(self) -> None:
         """Reset accumulated frames and open a new InputStream.
@@ -45,16 +57,17 @@ class AudioCapture:
         Raises:
             RuntimeError: If no audio input device is available (PortAudioError).
         """
+        _sd = _ensure_sd()
         self._frames = []
         try:
-            self._stream = sd.InputStream(
+            self._stream = _sd.InputStream(
                 samplerate=self.SAMPLE_RATE,
                 channels=self.CHANNELS,
                 dtype=self.DTYPE,
                 callback=self._callback,
             )
             self._stream.start()
-        except sd.PortAudioError:
+        except _sd.PortAudioError:
             logger.error("audio_device_unavailable", detail="No audio input device available")
             raise RuntimeError("No audio input device available")
 
