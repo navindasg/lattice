@@ -279,6 +279,10 @@ class VoicePipeline:
                 "Use --text for text-mode input instead."
             )
 
+        # Eager-load STT model at startup so first recording isn't slow
+        stt = self._ensure_stt()
+        stt._ensure_loaded()
+
         loop = asyncio.get_running_loop()
         hotkey = _HotkeyListener(self._config.hotkey, loop)
         hotkey.start()

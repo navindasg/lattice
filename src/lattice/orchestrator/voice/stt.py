@@ -113,7 +113,9 @@ class STTProvider:
             returned, avg_logprob is -1.0 (worst possible confidence).
         """
         model = self._ensure_loaded()
-        segments, _info = model.transcribe(audio_np, language="en", beam_size=5)  # type: ignore[union-attr]
+        # VAD filter requires float32 normalized to [-1, 1]
+        audio_f32 = audio_np.astype(np.float32) / 32768.0
+        segments, _info = model.transcribe(audio_f32, language="en", beam_size=5, vad_filter=True)  # type: ignore[union-attr]
 
         # CRITICAL: consume the lazy generator before processing
         all_segs = list(segments)

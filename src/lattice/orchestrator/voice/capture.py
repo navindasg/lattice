@@ -120,6 +120,16 @@ class AudioCapture:
         if duration_ms < self.MIN_DURATION_MS:
             return None
 
+        rms = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+        peak = int(np.max(np.abs(audio)))
+        logger.info(
+            "audio_captured",
+            duration_ms=int(duration_ms),
+            rms=rms,
+            peak=peak,
+            samples=len(audio),
+        )
+
         return audio
 
     def to_wav_bytes(self, audio: np.ndarray) -> bytes:

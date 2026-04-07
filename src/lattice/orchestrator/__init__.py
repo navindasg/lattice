@@ -2,7 +2,8 @@
 
 Re-exports data models, CircuitBreaker, ProcessManager for CC instance lifecycle management,
 NDJSON protocol helpers, TaskQueue for priority task routing, SoulFile models,
-ContextManager for per-instance utilization tracking, and MCP connector types.
+ContextManager for per-instance utilization tracking, MCP connector types,
+terminal backend types, and soul ecosystem types for orchestrator identity and state.
 """
 from lattice.orchestrator.breaker import CircuitBreaker
 from lattice.orchestrator.connectors import (
@@ -47,7 +48,36 @@ from lattice.orchestrator.soul import (
     SoulFile,
     write_soul_atomically,
 )
+from lattice.orchestrator.events import (
+    ApprovalDecision,
+    CCEvent,
+    EventEnvelope,
+    EventServer,
+    HealthResponse,
+    append_to_spool,
+    create_app,
+    drain_spool,
+    submit_approval,
+)
 from lattice.orchestrator.status import get_connector_status
+from lattice.orchestrator.terminal import (
+    CCInstance,
+    PaneInfo,
+    TerminalBackend,
+    TmuxBackend,
+    create_backend,
+)
+from lattice.orchestrator.soul_ecosystem import (
+    DecisionRecord,
+    InstanceAssignment,
+    OrchestratorState,
+    SoulContext,
+    SoulMemoryEntry,
+    SoulReader,
+    SoulWriter,
+    post_compaction_restore,
+    pre_compaction_flush,
+)
 from lattice.orchestrator.voice import (
     IntentResult,
     IntentRouter,
@@ -87,6 +117,12 @@ __all__ = [
     "RouteResult",
     "VoiceConfig",
     "VoicePipeline",
+    # Terminal backend
+    "TerminalBackend",
+    "TmuxBackend",
+    "PaneInfo",
+    "CCInstance",
+    "create_backend",
     # MCP connectors
     "BaseConnector",
     "ConnectorConfig",
@@ -99,4 +135,24 @@ __all__ = [
     "GitHubConnector",
     "MattermostConnector",
     "get_connector_status",
+    # Soul ecosystem
+    "DecisionRecord",
+    "InstanceAssignment",
+    "OrchestratorState",
+    "SoulContext",
+    "SoulMemoryEntry",
+    "SoulReader",
+    "SoulWriter",
+    "post_compaction_restore",
+    "pre_compaction_flush",
+    # Event channel
+    "ApprovalDecision",
+    "CCEvent",
+    "EventEnvelope",
+    "EventServer",
+    "HealthResponse",
+    "append_to_spool",
+    "create_app",
+    "drain_spool",
+    "submit_approval",
 ]

@@ -32,6 +32,7 @@ dependencies = [
     "PyGithub>=2.8",
     "mattermostautodriver>=11.5",
     "mcp>=1.26",
+    "libtmux>=0.37",
 ]
 
 [project.scripts]
