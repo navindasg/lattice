@@ -1421,3 +1421,195 @@ def orchestrator_start(project: str, config_path: str, no_voice: bool, as_json: 
         click.echo(f"Orchestrator starting for project: {project} at {root}")
 
     asyncio.run(runner.run())
+
+
+# ---------------------------------------------------------------------------
+# orchestrator:install-hooks command
+# ---------------------------------------------------------------------------
+
+
+@cli.command("orchestrator:install-hooks")
+@click.option(
+    "--settings",
+    "settings_path",
+    default=None,
+    help="Path to CC settings.json (default ~/.claude/settings.json).",
+)
+@click.option(
+    "--socket",
+    "sock_path",
+    default=None,
+    help="Path to orchestrator UDS socket (default ~/.lattice/orchestrator.sock).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output structured JSON envelope.")
+def orchestrator_install_hooks(
+    settings_path: str | None,
+    sock_path: str | None,
+    as_json: bool,
+) -> None:
+    """Install Lattice hooks into Claude Code settings.
+
+    Adds HTTP hooks for all 6 event types (SessionStart, PreToolUse, PostToolUse,
+    Stop, PreCompact, TaskCompleted). PreToolUse is synchronous (blocks CC for
+    orchestrator approval). All others are async.
+
+    Existing user hooks are preserved. Idempotent — safe to run multiple times.
+
+    Examples::
+
+        lattice orchestrator:install-hooks
+        lattice orchestrator:install-hooks --json
+        lattice orchestrator:install-hooks --settings /path/to/settings.json
+    """
+    from lattice.orchestrator.hooks import HookInstaller
+
+    installer = HookInstaller(
+        settings_path=Path(settings_path) if settings_path else None,
+        sock_path=Path(sock_path) if sock_path else None,
+    )
+
+    result = installer.install()
+
+    if as_json:
+        click.echo(json.dumps(success_response("orchestrator:install-hooks", {
+            "success": result.success,
+            "installed_count": result.installed_count,
+            "already_present": result.already_present,
+            "settings_path": result.settings_path,
+            "error": result.error,
+        })))
+    elif result.success:
+        click.echo(
+            f"Hooks installed: {result.installed_count} new, "
+            f"{result.already_present} already present. "
+            f"Settings: {result.settings_path}"
+        )
+    else:
+        raise click.ClickException(result.error or "Hook installation failed")
+
+
+# ---------------------------------------------------------------------------
+# orchestrator:uninstall-hooks command
+# ---------------------------------------------------------------------------
+
+
+@cli.command("orchestrator:uninstall-hooks")
+@click.option(
+    "--settings",
+    "settings_path",
+    default=None,
+    help="Path to CC settings.json (default ~/.claude/settings.json).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output structured JSON envelope.")
+def orchestrator_uninstall_hooks(
+    settings_path: str | None,
+    as_json: bool,
+) -> None:
+    """Remove Lattice hooks from Claude Code settings.
+
+    Removes only Lattice-managed hooks (identified by URL marker).
+    User's custom hooks are left untouched.
+
+    Examples::
+
+        lattice orchestrator:uninstall-hooks
+        lattice orchestrator:uninstall-hooks --json
+    """
+    from lattice.orchestrator.hooks import HookInstaller
+
+    installer = HookInstaller(
+        settings_path=Path(settings_path) if settings_path else None,
+    )
+
+    result = installer.uninstall()
+
+    if as_json:
+        click.echo(json.dumps(success_response("orchestrator:uninstall-hooks", {
+            "success": result.success,
+            "removed_count": result.removed_count,
+            "settings_path": result.settings_path,
+            "error": result.error,
+        })))
+    elif result.success:
+        click.echo(
+            f"Hooks removed: {result.removed_count}. "
+            f"Settings: {result.settings_path}"
+        )
+    else:
+        raise click.ClickException(result.error or "Hook uninstallation failed")
+
+
+# ---------------------------------------------------------------------------
+# orchestrator:check-hooks command
+# ---------------------------------------------------------------------------
+
+
+@cli.command("orchestrator:check-hooks")
+@click.option(
+    "--settings",
+    "settings_path",
+    default=None,
+    help="Path to CC settings.json (default ~/.claude/settings.json).",
+)
+@click.option(
+    "--socket",
+    "sock_path",
+    default=None,
+    help="Path to orchestrator UDS socket (default ~/.lattice/orchestrator.sock).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output structured JSON envelope.")
+def orchestrator_check_hooks(
+    settings_path: str | None,
+    sock_path: str | None,
+    as_json: bool,
+) -> None:
+    """Check Lattice hook installation status and orchestrator reachability.
+
+    Reports per-event-type status: installed/missing/unreachable.
+
+    Examples::
+
+        lattice orchestrator:check-hooks
+        lattice orchestrator:check-hooks --json
+    """
+    from lattice.orchestrator.hooks import HookInstaller
+
+    installer = HookInstaller(
+        settings_path=Path(settings_path) if settings_path else None,
+        sock_path=Path(sock_path) if sock_path else None,
+    )
+
+    result = installer.check()
+
+    if as_json:
+        click.echo(json.dumps(success_response("orchestrator:check-hooks", {
+            "all_installed": result.all_installed,
+            "events": [
+                {
+                    "event_type": e.event_type,
+                    "installed": e.installed,
+                    "reachable": e.reachable,
+                }
+                for e in result.events
+            ],
+            "settings_path": result.settings_path,
+            "error": result.error,
+        })))
+    else:
+        status_icon = {True: "OK", False: "MISSING", None: "—"}
+        reach_icon = {True: "reachable", False: "unreachable", None: "—"}
+
+        click.echo(f"Hook status (settings: {result.settings_path}):")
+        for event in result.events:
+            installed_str = status_icon[event.installed]
+            reachable_str = reach_icon.get(event.reachable, "—")
+            click.echo(
+                f"  {event.event_type:<20} "
+                f"installed={installed_str:<8} "
+                f"socket={reachable_str}"
+            )
+
+        if result.all_installed:
+            click.echo("All hooks installed.")
+        else:
+            click.echo("Some hooks are missing. Run: lattice orchestrator:install-hooks")

@@ -12,6 +12,13 @@ from pydantic import BaseModel
 
 
 IntentCategory = Literal[
+    "cc_command",
+    "cc_approve",
+    "cc_deny",
+    "cc_deny_redirect",
+    "cc_status",
+    "cc_interrupt",
+    "orchestrator_freeform",
     "task_dispatch",
     "context_injection",
     "status_query",
@@ -54,7 +61,7 @@ class IntentResult(BaseModel):
     Frozen — use model_copy(update=...) to create modified instances.
 
     Fields:
-        category: one of the 5 IntentCategory literals
+        category: one of the IntentCategory literals
         transcript: the original transcribed text
         confidence: classification confidence in [0.0, 1.0]
         extracted: parsed slots dict, e.g. {"target": "auth/"} for

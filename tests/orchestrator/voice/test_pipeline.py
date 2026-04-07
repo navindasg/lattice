@@ -7,6 +7,9 @@ Tests cover:
     - beep_start / beep_stop subprocess calls on darwin
     - orchestrator:voice CLI command with --text flag
     - CLI --json flag output format
+    - CC intent end-to-end via process_text
+    - voice_request_id tracing in all pipeline results
+    - orchestrator_freeform fallback for unrecognized input
 """
 from __future__ import annotations
 
@@ -77,11 +80,11 @@ def test_process_text_status_returned() -> None:
     assert result.action == "status_returned"
 
 
-def test_process_text_unrecognized() -> None:
-    """process_text("asdf gibberish") routes to unrecognized."""
+def test_process_text_freeform_replaces_unrecognized() -> None:
+    """process_text("asdf gibberish") routes to orchestrator_freeform_dispatched."""
     pipeline = _make_pipeline()
     result = pipeline.process_text("asdf gibberish")
-    assert result.action == "unrecognized"
+    assert result.action == "orchestrator_freeform_dispatched"
 
 
 def test_process_text_task_dispatch() -> None:
@@ -92,9 +95,9 @@ def test_process_text_task_dispatch() -> None:
 
 
 def test_process_text_context_injection() -> None:
-    """process_text("tell instance 1 about auth") routes to context_injected."""
+    """process_text("tell instance one about auth") routes to context_injected."""
     pipeline = _make_pipeline()
-    result = pipeline.process_text("tell instance 1 about auth")
+    result = pipeline.process_text("tell instance one about auth")
     assert result.action == "context_injected"
 
 
@@ -121,6 +124,113 @@ def test_process_text_routes_through_classifier_and_router() -> None:
     mock_classifier.classify.assert_called_once_with("fix auth")
     mock_router.dispatch.assert_called_once_with(mock_intent)
     assert result.action == "task_enqueued"
+
+
+# ---------------------------------------------------------------------------
+# voice_request_id tracing tests
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceRequestIdTracing:
+    def test_process_text_always_has_voice_request_id(self) -> None:
+        """Every process_text result includes voice_request_id in data."""
+        pipeline = _make_pipeline()
+
+        for text in [
+            "map the auth directory",
+            "what's the status",
+            "start working on auth",
+            "the client wants dark mode",
+        ]:
+            result = pipeline.process_text(text)
+            assert "voice_request_id" in result.data, (
+                f"Missing voice_request_id for '{text}' (action={result.action})"
+            )
+
+    def test_cc_command_preserves_router_voice_request_id(self) -> None:
+        """CC intents that already have voice_request_id from router keep it."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("tell 3 to fix the bug")
+        assert result.action == "cc_command_dispatched"
+        assert "voice_request_id" in result.data
+        assert len(result.data["voice_request_id"]) == 36  # UUID4
+
+    def test_unique_voice_request_ids_across_calls(self) -> None:
+        """Successive process_text calls produce unique voice_request_ids."""
+        pipeline = _make_pipeline()
+        r1 = pipeline.process_text("map auth")
+        r2 = pipeline.process_text("map auth")
+        assert r1.data["voice_request_id"] != r2.data["voice_request_id"]
+
+
+# ---------------------------------------------------------------------------
+# CC intent end-to-end via process_text
+# ---------------------------------------------------------------------------
+
+
+class TestCCIntentEndToEnd:
+    def test_cc_command_end_to_end(self) -> None:
+        """process_text('tell 3 to fix the bug') -> cc_command_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("tell 3 to fix the bug")
+        assert result.action == "cc_command_dispatched"
+        assert result.data["instance"] == "3"
+        assert result.data["message"] == "fix the bug"
+
+    def test_cc_approve_end_to_end(self) -> None:
+        """process_text('4 approved') -> cc_approve_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("4 approved")
+        assert result.action == "cc_approve_dispatched"
+        assert result.data["instance"] == "4"
+
+    def test_cc_deny_end_to_end(self) -> None:
+        """process_text('deny 4') -> cc_deny_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("deny 4")
+        assert result.action == "cc_deny_dispatched"
+        assert result.data["instance"] == "4"
+
+    def test_cc_deny_redirect_end_to_end(self) -> None:
+        """process_text('6 denied, tell it to use AWS') -> cc_deny_redirect_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("6 denied, tell it to use AWS")
+        assert result.action == "cc_deny_redirect_dispatched"
+        assert result.data["instance"] == "6"
+        assert "use AWS" in result.data["message"]
+
+    def test_cc_status_end_to_end(self) -> None:
+        """process_text("what's 2 doing") -> cc_status_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("what's 2 doing")
+        assert result.action == "cc_status_dispatched"
+        assert result.data["instance"] == "2"
+
+    def test_cc_interrupt_end_to_end(self) -> None:
+        """process_text('stop 5') -> cc_interrupt_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("stop 5")
+        assert result.action == "cc_interrupt_dispatched"
+        assert result.data["instance"] == "5"
+
+    def test_orchestrator_freeform_end_to_end(self) -> None:
+        """process_text('we need to ship auth by Friday') -> orchestrator_freeform_dispatched."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("we need to ship auth by Friday")
+        assert result.action == "orchestrator_freeform_dispatched"
+        assert "ship auth" in result.data["message"]
+
+    def test_existing_mapper_no_regression(self) -> None:
+        """'map the auth directory' still routes correctly after CC intents added."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("map the auth directory")
+        assert result.action == "mapper_dispatched"
+
+    def test_existing_status_no_regression(self) -> None:
+        """'what's the status' still routes correctly (no instance number)."""
+        pipeline = _make_pipeline()
+        result = pipeline.process_text("what's the status")
+        assert result.action == "status_returned"
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +305,22 @@ def test_process_audio_empty_transcript_returns_empty_transcript_result() -> Non
 
     assert result.success is False
     assert result.action == "empty_transcript"
+
+
+def test_process_audio_has_voice_request_id() -> None:
+    """process_audio result includes voice_request_id."""
+    config = VoiceConfig()
+
+    mock_stt = MagicMock()
+    mock_stt.transcribe_with_fallback.return_value = "tell 3 to fix it"
+
+    pipeline = VoicePipeline(config=config, router=IntentRouter())
+    pipeline._stt = mock_stt
+
+    audio_np = np.zeros(16000, dtype=np.int16)
+    result = pipeline.process_audio(audio_np)
+
+    assert "voice_request_id" in result.data
 
 
 # ---------------------------------------------------------------------------
@@ -276,14 +402,14 @@ def test_cli_voice_text_status_returned(cli_runner: CliRunner) -> None:
     assert "status_returned" in result.output
 
 
-def test_cli_voice_text_unrecognized(cli_runner: CliRunner) -> None:
-    """orchestrator:voice --text 'asdfghjkl' outputs unrecognized."""
+def test_cli_voice_text_freeform(cli_runner: CliRunner) -> None:
+    """orchestrator:voice --text 'asdfghjkl' now outputs orchestrator_freeform_dispatched."""
     from lattice.cli.commands import cli
 
     result = cli_runner.invoke(cli, ["orchestrator:voice", "--text", "asdfghjkl"])
 
     assert result.exit_code == 0, result.output
-    assert "unrecognized" in result.output
+    assert "orchestrator_freeform_dispatched" in result.output
 
 
 def test_cli_voice_text_task_enqueued(cli_runner: CliRunner) -> None:
@@ -294,6 +420,16 @@ def test_cli_voice_text_task_enqueued(cli_runner: CliRunner) -> None:
 
     assert result.exit_code == 0, result.output
     assert "task_enqueued" in result.output
+
+
+def test_cli_voice_text_cc_command(cli_runner: CliRunner) -> None:
+    """orchestrator:voice --text 'tell 3 to fix the bug' outputs cc_command_dispatched."""
+    from lattice.cli.commands import cli
+
+    result = cli_runner.invoke(cli, ["orchestrator:voice", "--text", "tell 3 to fix the bug"])
+
+    assert result.exit_code == 0, result.output
+    assert "cc_command_dispatched" in result.output
 
 
 def test_cli_voice_text_json_flag(cli_runner: CliRunner) -> None:
@@ -474,7 +610,12 @@ async def test_process_text_async_completes_pending() -> None:
     ) as mock_complete:
         result = await pipeline.process_text_async("map status on auth")
 
-    mock_complete.assert_called_once_with(pending_result)
+    # The pending result passed to complete_mapper_dispatch will have voice_request_id
+    # added by _ensure_voice_request_id, so check it was called once with any args.
+    mock_complete.assert_called_once()
+    actual_arg = mock_complete.call_args[0][0]
+    assert actual_arg.action == "mapper_dispatch_pending"
+    assert "voice_request_id" in actual_arg.data
     assert result.action == "mapper_dispatched"
 
 

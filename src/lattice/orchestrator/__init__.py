@@ -5,6 +5,17 @@ NDJSON protocol helpers, TaskQueue for priority task routing, SoulFile models,
 ContextManager for per-instance utilization tracking, MCP connector types,
 terminal backend types, and soul ecosystem types for orchestrator identity and state.
 """
+from lattice.orchestrator.agent import (
+    ALL_TOOLS,
+    AgentEventLoop,
+    AgentState,
+    DuckDBCheckpointer,
+    InstanceInfo,
+    PendingApproval,
+    ToolContext,
+    build_orchestrator_graph,
+    build_system_prompt,
+)
 from lattice.orchestrator.breaker import CircuitBreaker
 from lattice.orchestrator.connectors import (
     BaseConnector,
@@ -78,6 +89,14 @@ from lattice.orchestrator.soul_ecosystem import (
     post_compaction_restore,
     pre_compaction_flush,
 )
+from lattice.orchestrator.hooks import (
+    HookCheckResult,
+    HookDefinition,
+    HookEventStatus,
+    HookInstallResult,
+    HookInstaller,
+    HookUninstallResult,
+)
 from lattice.orchestrator.voice import (
     IntentResult,
     IntentRouter,
@@ -87,6 +106,17 @@ from lattice.orchestrator.voice import (
 )
 
 __all__ = [
+    # Agent
+    "ALL_TOOLS",
+    "AgentEventLoop",
+    "AgentState",
+    "DuckDBCheckpointer",
+    "InstanceInfo",
+    "PendingApproval",
+    "ToolContext",
+    "build_orchestrator_graph",
+    "build_system_prompt",
+    # Core
     "BreakerConfig",
     "CircuitBreakerState",
     "CircuitBreaker",
@@ -145,6 +175,13 @@ __all__ = [
     "SoulWriter",
     "post_compaction_restore",
     "pre_compaction_flush",
+    # Hook installer
+    "HookCheckResult",
+    "HookDefinition",
+    "HookEventStatus",
+    "HookInstallResult",
+    "HookInstaller",
+    "HookUninstallResult",
     # Event channel
     "ApprovalDecision",
     "CCEvent",

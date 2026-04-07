@@ -130,15 +130,35 @@ class VoicePipeline:
 
         Skips audio capture and STT. Routes text directly through the same
         IntentClassifier -> IntentRouter pipeline as voice input.
+        Ensures all results include a voice_request_id for tracing.
 
         Args:
             text: The typed command text to classify and route.
 
         Returns:
-            RouteResult from IntentRouter.dispatch.
+            RouteResult from IntentRouter.dispatch with voice_request_id.
         """
         intent = self._classifier.classify(text)
-        return self._router.dispatch(intent)
+        result = self._router.dispatch(intent)
+        return self._ensure_voice_request_id(result)
+
+    @staticmethod
+    def _ensure_voice_request_id(result: RouteResult) -> RouteResult:
+        """Ensure RouteResult.data contains a voice_request_id for tracing.
+
+        If the router already set one (CC intents do), keep it.
+        Otherwise generate a new UUID4.
+
+        Args:
+            result: The RouteResult to augment.
+
+        Returns:
+            RouteResult with voice_request_id in data.
+        """
+        if "voice_request_id" in result.data:
+            return result
+        augmented_data = {**result.data, "voice_request_id": str(uuid.uuid4())}
+        return result.model_copy(update={"data": augmented_data})
 
     def process_audio(self, audio_np: np.ndarray) -> RouteResult:
         """Process captured audio through full STT -> intent -> route pipeline.
@@ -168,11 +188,12 @@ class VoicePipeline:
 
         intent = self._classifier.classify(transcript)
         result = self._router.dispatch(intent)
+        result = self._ensure_voice_request_id(result)
         self._log.info(
             "voice_command_processed",
             transcript=transcript,
             action=result.action,
-            voice_request_id=str(uuid.uuid4()),
+            voice_request_id=result.data.get("voice_request_id", ""),
         )
         return result
 

@@ -3,6 +3,10 @@
 Provides push-to-talk audio capture, speech-to-text transcription,
 intent classification, and routing for operator voice commands.
 
+Supports CC instance control intents (cc_command, cc_approve, cc_deny,
+cc_deny_redirect, cc_status, cc_interrupt) and orchestrator_freeform
+for LLM-powered interpretation of unrecognized utterances.
+
 All public classes are re-exported here for convenient access:
     from lattice.orchestrator.voice import VoicePipeline, IntentRouter
 
