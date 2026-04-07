@@ -1282,6 +1282,7 @@ def orchestrator_voice(
                 return
 
             # Voice listener mode: start push-to-talk loop
+            click.echo(f"🎤 Voice listener ready. Hold [{voice_config.hotkey.strip('<>')}] to talk, release to process. Ctrl+C to quit.")
             await pipeline.run_listener()
         finally:
             if manager is not None:

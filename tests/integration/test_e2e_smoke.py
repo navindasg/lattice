@@ -250,6 +250,18 @@ class TestTier2MapDoc:
             "Input tokens is 0 — LLM was not called"
         )
 
+        # Verify _dir.md files were produced with valid content (#46)
+        agent_docs = target / ".agent-docs"
+        dir_md_files = list(agent_docs.rglob("_dir.md"))
+        assert len(dir_md_files) > 0, (
+            f"No _dir.md files produced — parse may still be broken. Output:\n{result.output}"
+        )
+        for md_file in dir_md_files:
+            content = md_file.read_text()
+            assert "confidence:" in content.lower() or "confidence" in content.lower(), (
+                f"{md_file} missing confidence score"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Tier 3: Voice pipeline via text mode + mapper subprocess (no mic)

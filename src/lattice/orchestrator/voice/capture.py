@@ -31,6 +31,26 @@ def _ensure_sd():  # noqa: ANN202
     return sd
 
 
+def check_microphone() -> bool:
+    """Check whether an audio input device is available.
+
+    Returns True if at least one input device exists, False otherwise.
+    Logs the detected device name on success.
+    """
+    try:
+        _sd = _ensure_sd()
+        device_info = _sd.query_devices(kind="input")
+        logger.info(
+            "microphone_detected",
+            device=device_info.get("name", "unknown"),
+            sample_rate=device_info.get("default_samplerate"),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("no_microphone_detected", error=str(exc))
+        return False
+
+
 class AudioCapture:
     """Captures 16kHz mono int16 audio from the default input device.
 

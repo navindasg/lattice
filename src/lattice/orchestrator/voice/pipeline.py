@@ -270,8 +270,14 @@ class VoicePipeline:
         Calls beep_start on hotkey press (recording begins) and beep_stop on
         release (recording ends, processing starts).
         """
-        from lattice.orchestrator.voice.capture import AudioCapture as _AudioCapture
+        from lattice.orchestrator.voice.capture import AudioCapture as _AudioCapture, check_microphone
         from lattice.orchestrator.voice.hotkey import HotkeyListener as _HotkeyListener
+
+        if not check_microphone():
+            raise RuntimeError(
+                "No microphone detected. Push-to-talk requires an audio input device. "
+                "Use --text for text-mode input instead."
+            )
 
         loop = asyncio.get_running_loop()
         hotkey = _HotkeyListener(self._config.hotkey, loop)

@@ -646,3 +646,189 @@ async def test_idk_structlog(tmp_path, capsys):
     assert entry.get("idk_mode") is True
     assert entry.get("search_radius") == 2
     assert entry.get("passes") == 2
+
+
+# ---------------------------------------------------------------------------
+# _extract_json tests (#46)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJson:
+    """Tests for _extract_json which handles markdown-wrapped LLM responses."""
+
+    def test_raw_json(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        raw = '{"key": "value"}'
+        assert _extract_json(raw) == raw
+
+    def test_raw_json_with_whitespace(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        assert _extract_json('  \n{"key": "value"}\n  ') == '{"key": "value"}'
+
+    def test_json_in_json_fence(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        content = 'Here is the result:\n```json\n{"key": "value"}\n```\nDone.'
+        assert _extract_json(content) == '{"key": "value"}'
+
+    def test_json_in_plain_fence(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        content = 'Result:\n```\n{"key": "value"}\n```'
+        assert _extract_json(content) == '{"key": "value"}'
+
+    def test_json_surrounded_by_prose(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        content = 'Here is my analysis:\n{"key": "value"}\nHope this helps!'
+        assert _extract_json(content) == '{"key": "value"}'
+
+    def test_nested_braces(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        content = 'Output: {"outer": {"inner": 1}}'
+        assert _extract_json(content) == '{"outer": {"inner": 1}}'
+
+    def test_no_json_returns_original(self):
+        from lattice.fleet.dispatcher import _extract_json
+
+        content = "No JSON here at all"
+        assert _extract_json(content) == content
+
+
+# ---------------------------------------------------------------------------
+# _split_files_into_chunks tests
+# ---------------------------------------------------------------------------
+
+
+class TestSplitFilesIntoChunks:
+    """Tests for file splitting based on output token budget."""
+
+    def test_small_directory_no_split(self, tmp_path: Path):
+        from lattice.fleet.dispatcher import _split_files_into_chunks
+
+        # 2 small files — well under budget
+        for i in range(2):
+            (tmp_path / f"file_{i}.py").write_text("x = 1\n")
+
+        files = sorted(tmp_path.glob("*.py"))
+        chunks = _split_files_into_chunks(files)
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 2
+
+    def test_large_directory_splits(self, tmp_path: Path):
+        from lattice.fleet.dispatcher import _split_files_into_chunks
+
+        # 20 files × 200 lines each — should exceed budget and split
+        for i in range(20):
+            content = "\n".join(f"line_{j} = {j}" for j in range(200))
+            (tmp_path / f"module_{i}.py").write_text(content)
+
+        files = sorted(tmp_path.glob("*.py"))
+        chunks = _split_files_into_chunks(files)
+        assert len(chunks) > 1
+        # All files accounted for
+        total_files = sum(len(c) for c in chunks)
+        assert total_files == 20
+
+    def test_empty_files_list(self):
+        from lattice.fleet.dispatcher import _split_files_into_chunks
+
+        assert _split_files_into_chunks([]) == []
+
+    def test_single_large_file_not_split(self, tmp_path: Path):
+        from lattice.fleet.dispatcher import _split_files_into_chunks
+
+        # One file with many lines — can't split further
+        content = "\n".join(f"line_{i} = {i}" for i in range(5000))
+        (tmp_path / "big.py").write_text(content)
+
+        files = list(tmp_path.glob("*.py"))
+        chunks = _split_files_into_chunks(files)
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _merge_dir_docs tests
+# ---------------------------------------------------------------------------
+
+
+class TestMergeDirDocs:
+    """Tests for merging partial DirDoc results from chunked calls."""
+
+    def _make_doc(self, **overrides) -> "DirDoc":
+        from lattice.shadow.schema import DirDoc, GapSummary, StaticAnalysisLimits
+        from datetime import datetime, timezone
+
+        defaults = {
+            "directory": "src/auth",
+            "confidence": 0.8,
+            "source": "agent",
+            "confidence_factors": ["reviewed"],
+            "last_analyzed": datetime.now(timezone.utc),
+            "summary": "Auth module.",
+            "responsibilities": ["JWT handling"],
+            "developer_hints": [],
+            "child_refs": [],
+            "gap_summary": GapSummary(),
+            "static_analysis_limits": StaticAnalysisLimits(),
+        }
+        defaults.update(overrides)
+        return DirDoc(**defaults)
+
+    def test_single_doc_passthrough(self):
+        from lattice.fleet.dispatcher import _merge_dir_docs
+
+        doc = self._make_doc()
+        stubs = [{"stub_file": "test.py", "content": "def test(): pass"}]
+        merged_doc, merged_stubs = _merge_dir_docs([doc], [stubs])
+        assert merged_doc.confidence == 0.8
+        assert merged_stubs == stubs
+
+    def test_two_docs_merge(self):
+        from lattice.fleet.dispatcher import _merge_dir_docs
+
+        doc1 = self._make_doc(
+            confidence=0.9,
+            confidence_factors=["factor_a"],
+            summary="Part one.",
+            responsibilities=["auth"],
+        )
+        doc2 = self._make_doc(
+            confidence=0.7,
+            confidence_factors=["factor_b"],
+            summary="Part two.",
+            responsibilities=["auth", "tokens"],
+        )
+        merged, stubs = _merge_dir_docs([doc1, doc2], [[], []])
+
+        assert merged.confidence == 0.8  # average of 0.9 and 0.7
+        assert "factor_a" in merged.confidence_factors
+        assert "factor_b" in merged.confidence_factors
+        assert "Part one." in merged.summary
+        assert "Part two." in merged.summary
+        assert "auth" in merged.responsibilities
+        assert "tokens" in merged.responsibilities
+        # Deduplication
+        assert merged.responsibilities.count("auth") == 1
+
+    def test_empty_docs_returns_none(self):
+        from lattice.fleet.dispatcher import _merge_dir_docs
+
+        doc, stubs = _merge_dir_docs([], [])
+        assert doc is None
+        assert stubs == []
+
+    def test_stubs_capped_at_three(self):
+        from lattice.fleet.dispatcher import _merge_dir_docs
+
+        doc1 = self._make_doc()
+        doc2 = self._make_doc()
+        stubs1 = [{"stub_file": f"s{i}.py", "content": "pass"} for i in range(2)]
+        stubs2 = [{"stub_file": f"s{i}.py", "content": "pass"} for i in range(2, 5)]
+
+        _, merged_stubs = _merge_dir_docs([doc1, doc2], [stubs1, stubs2])
+        assert len(merged_stubs) == 3

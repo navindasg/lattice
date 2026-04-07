@@ -42,6 +42,25 @@ _TOKENS_PER_CHILD_SUMMARY = 200
 # Files to skip when reading directory contents
 _SKIP_HIDDEN = frozenset({"__pycache__", ".git", ".mypy_cache", ".pytest_cache"})
 
+# Output token estimation constants (calibrated from real runs)
+_OUTPUT_FIXED_OVERHEAD = 200  # JSON structure, field names, boilerplate
+_OUTPUT_TOKENS_PER_STUB = 125  # Per test_stub (minimal skeleton)
+_OUTPUT_MAX_STUBS = 3  # Prompt-enforced cap
+_OUTPUT_ALPHA = 240  # Tokens per file (responsibilities, confidence_factors)
+_OUTPUT_BETA = 1.5  # Tokens per line (summary density)
+_OUTPUT_BUDGET_CEILING = 4096  # Max output tokens before splitting
+
+
+def _estimate_output_tokens(file_count: int, total_lines: int) -> int:
+    """Estimate output tokens from file count and total lines.
+
+    Formula: T_fixed + T_stubs + max(alpha * file_count, beta * total_lines)
+    """
+    t_fixed = _OUTPUT_FIXED_OVERHEAD
+    t_stubs = min(file_count, _OUTPUT_MAX_STUBS) * _OUTPUT_TOKENS_PER_STUB
+    t_content = max(_OUTPUT_ALPHA * file_count, _OUTPUT_BETA * total_lines)
+    return int(t_fixed + t_stubs + t_content)
+
 _SYSTEM_PROMPT = """\
 You are a codebase documentation agent. Your task is to analyze a directory in a \
 software project and produce a structured documentation summary.
@@ -74,7 +93,14 @@ the top untested seams (from gap entries). Each stub:
   "content": "<full Python file content with imports, stub functions, TODO comments>"
 }
 
-Respond with valid JSON only. No markdown, no commentary.\
+IMPORTANT CONSTRAINTS:
+- Respond with valid JSON only. No markdown fences, no commentary, no prose.
+- Keep confidence_factors to 2-3 SHORT phrases (under 15 words each).
+- Keep summary to 2-3 sentences maximum.
+- Keep responsibilities to 3-5 SHORT bullet points.
+- test_stubs: include at most 3 stubs. Each stub content should be a minimal skeleton \
+(imports + function signature + single TODO comment), NOT full implementations.
+- Total response must fit within 4000 tokens. Be concise.\
 """
 
 
@@ -94,6 +120,7 @@ class PromptBuilder:
         agent_docs_root: Path,
         idk_mode: bool = False,
         prompt_angle: str = "default",
+        file_subset: list[Path] | None = None,
     ) -> tuple[list[dict], int]:
         """Assemble a full investigation prompt for a directory.
 
@@ -106,6 +133,8 @@ class PromptBuilder:
             idk_mode: If True, include 2-hop neighbor file contents in the prompt.
             prompt_angle: Angle-specific prompt guidance ('default', 'integration',
                           or 'data_flow').
+            file_subset: If provided, only include these files instead of scanning
+                         the directory. Used for chunked dispatch.
 
         Returns:
             Tuple of (messages, estimated_tokens):
@@ -121,8 +150,8 @@ class PromptBuilder:
         if not dir_path.exists() or not dir_path.is_dir():
             return [], 0
 
-        # 1. Collect files (skip hidden dirs and __pycache__)
-        file_entries = self._collect_files(dir_path)
+        # 1. Collect files (use subset if provided, otherwise scan directory)
+        file_entries = file_subset if file_subset is not None else self._collect_files(dir_path)
 
         # 2. Read file contents (full, no truncation — user locked decision)
         file_contents = self._read_file_contents(file_entries)
@@ -258,6 +287,50 @@ class PromptBuilder:
             gap_count=len(gap_entries),
             child_count=len(child_summaries),
         )
+
+    def estimate_output_tokens(
+        self,
+        directory: str,
+        project_root: Path,
+    ) -> int:
+        """Estimate output token count for a directory based on file count and lines.
+
+        Formula: T_fixed + T_stubs + max(alpha * file_count, beta * line_count)
+        where alpha=240 tokens/file, beta=1.5 tokens/line.
+
+        Args:
+            directory: Absolute or relative path to the directory.
+            project_root: Project root for relative path computation.
+
+        Returns:
+            Estimated output token count.
+        """
+        dir_path = Path(directory)
+        if not dir_path.is_absolute() and project_root:
+            dir_path = Path(project_root) / dir_path
+
+        if not dir_path.exists() or not dir_path.is_dir():
+            return 0
+
+        files = self._collect_files(dir_path)
+        file_count = len(files)
+        total_lines = 0
+        for f in files:
+            try:
+                total_lines += sum(1 for _ in f.open(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        return _estimate_output_tokens(file_count, total_lines)
+
+    def collect_file_paths(self, directory: str, project_root: Path) -> list[Path]:
+        """Return sorted source file paths in a directory (public for split logic)."""
+        dir_path = Path(directory)
+        if not dir_path.is_absolute() and project_root:
+            dir_path = Path(project_root) / dir_path
+        if not dir_path.exists() or not dir_path.is_dir():
+            return []
+        return self._collect_files(dir_path)
 
     # ------------------------------------------------------------------
     # Private helpers

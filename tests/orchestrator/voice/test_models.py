@@ -12,7 +12,7 @@ from tests.orchestrator.voice.fixtures.transcripts import TRANSCRIPT_FIXTURES
 class TestVoiceConfigDefaults:
     def test_default_hotkey(self) -> None:
         cfg = VoiceConfig()
-        assert cfg.hotkey == "<f13>"
+        assert cfg.hotkey == "<cmd_r>"
 
     def test_default_model_size(self) -> None:
         cfg = VoiceConfig()
@@ -134,7 +134,7 @@ class TestLatticeSettingsVoice:
 
     def test_voice_field_has_defaults(self) -> None:
         settings = LatticeSettings()
-        assert settings.voice.hotkey == "<f13>"
+        assert settings.voice.hotkey == "<cmd_r>"
         assert settings.voice.model_size == "small.en"
         assert settings.voice.confidence_threshold == -0.6
         assert settings.voice.min_duration_ms == 300

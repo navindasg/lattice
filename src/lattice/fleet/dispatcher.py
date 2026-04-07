@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
 from lattice.fleet.models import AgentResult, Wave
-from lattice.fleet.prompt import PromptBuilder
+from lattice.fleet.prompt import PromptBuilder, _OUTPUT_BUDGET_CEILING, _estimate_output_tokens
 from lattice.shadow.reader import parse_dir_doc
 from lattice.shadow.schema import DirDoc
 
@@ -57,6 +58,70 @@ def _extract_token_usage(response: AIMessage) -> tuple[int, int]:
     return 0, 0
 
 
+def _extract_text_content(content: str | list) -> str:
+    """Normalize AIMessage.content to a plain string.
+
+    LangChain returns a plain string for OpenAI but a list of content blocks
+    (e.g. [{"type": "text", "text": "..."}]) for Anthropic. This extracts
+    the text from either format.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_json(content: str) -> str:
+    """Extract JSON from LLM responses that may wrap it in markdown fences or prose.
+
+    Tries in order:
+    1. Raw content as-is (already valid JSON)
+    2. Content inside ```json ... ``` fences
+    3. Content inside ``` ... ``` fences (no language tag)
+    4. First { ... } block found in the content
+
+    Returns the extracted string (not yet parsed) for json.loads to handle.
+    """
+    # 1. Try raw content — cheapest check
+    stripped = content.strip()
+    if stripped.startswith("{"):
+        return stripped
+
+    # 2. Try ```json ... ``` fences (with or without closing fence for truncated output)
+    match = re.search(r"```json\s*\n(.*?)(?:```|$)", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # 3. Try ``` ... ``` fences (no language tag, with or without closing fence)
+    match = re.search(r"```\s*\n(.*?)(?:```|$)", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # 4. Find the outermost { ... } block via brace-depth matching
+    start = content.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(content)):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return content[start : i + 1]
+        # Truncated JSON (no matching close brace) — return from first { to end
+        return content[start:].strip()
+
+    # Nothing found — return as-is so json.loads reports the original error
+    return content
+
+
 def _parse_agent_response(content: str, directory: str) -> tuple[DirDoc | None, list[dict]]:
     """Parse JSON response from agent into a DirDoc instance and test_stubs.
 
@@ -73,7 +138,7 @@ def _parse_agent_response(content: str, directory: str) -> tuple[DirDoc | None, 
         Tuple of (dir_doc, test_stubs) where dir_doc may be None on parse or validation failure.
     """
     try:
-        parsed = json.loads(content)
+        parsed = json.loads(_extract_json(content))
     except (json.JSONDecodeError, ValueError) as exc:
         log.warning("agent_response_parse_failed", directory=directory, error=str(exc))
         return None, []
@@ -96,6 +161,145 @@ def _parse_agent_response(content: str, directory: str) -> tuple[DirDoc | None, 
             error=str(exc),
         )
         return None, test_stubs
+
+
+def _split_files_into_chunks(
+    files: list[Path], budget: int = _OUTPUT_BUDGET_CEILING
+) -> list[list[Path]]:
+    """Split a directory's files into chunks that each fit within the output token budget.
+
+    Greedily accumulates files until adding the next file would exceed the budget.
+    Each chunk is sized so the estimated output tokens stay under the ceiling.
+
+    Args:
+        files: Sorted list of file paths in the directory.
+        budget: Output token ceiling per LLM call.
+
+    Returns:
+        List of file-path lists (chunks). Single-element list if no split needed.
+    """
+    if not files:
+        return []
+
+    chunks: list[list[Path]] = []
+    current_chunk: list[Path] = []
+    current_file_count = 0
+    current_line_count = 0
+
+    for f in files:
+        try:
+            file_lines = sum(1 for _ in f.open(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            file_lines = 0
+
+        projected = _estimate_output_tokens(
+            current_file_count + 1, current_line_count + file_lines
+        )
+
+        if current_chunk and projected > budget:
+            chunks.append(current_chunk)
+            current_chunk = [f]
+            current_file_count = 1
+            current_line_count = file_lines
+        else:
+            current_chunk.append(f)
+            current_file_count += 1
+            current_line_count += file_lines
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _merge_dir_docs(docs: list[DirDoc], test_stubs_lists: list[list[dict]]) -> tuple[DirDoc | None, list[dict]]:
+    """Merge partial DirDoc results from chunked LLM calls into a single DirDoc.
+
+    Strategy:
+    - confidence: weighted average (not min — each chunk has valid signal)
+    - confidence_factors: concatenate and deduplicate
+    - summary: join with space
+    - responsibilities: concatenate and deduplicate
+    - developer_hints, child_refs, cross_cutting_refs, integration_points: union
+    - gap_summary: sum untested_edges, concatenate top_gaps
+    - static_analysis_limits: sum counts
+    - test_stubs: concatenate, cap at 3
+
+    Args:
+        docs: Non-empty list of DirDoc instances from chunk calls.
+        test_stubs_lists: Corresponding test_stubs from each call.
+
+    Returns:
+        Merged (DirDoc, test_stubs) tuple, or (None, []) if docs is empty.
+    """
+    if not docs:
+        return None, []
+
+    if len(docs) == 1:
+        return docs[0], test_stubs_lists[0] if test_stubs_lists else []
+
+    # Deduplicate while preserving order
+    def _dedup(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    all_confidence_factors: list[str] = []
+    all_responsibilities: list[str] = []
+    all_hints: list[str] = []
+    all_child_refs: list[str] = []
+    all_cross_cutting: list[str] = []
+    all_integration: list[dict] = []
+    all_top_gaps: list[dict] = []
+    summaries: list[str] = []
+    total_untested = 0
+    total_dynamic = 0
+    total_unresolved = 0
+    confidence_sum = 0.0
+
+    for doc in docs:
+        confidence_sum += doc.confidence
+        all_confidence_factors.extend(doc.confidence_factors)
+        summaries.append(doc.summary)
+        all_responsibilities.extend(doc.responsibilities)
+        all_hints.extend(doc.developer_hints)
+        all_child_refs.extend(doc.child_refs)
+        all_cross_cutting.extend(doc.cross_cutting_refs)
+        all_integration.extend(doc.integration_points)
+        total_untested += doc.gap_summary.untested_edges
+        all_top_gaps.extend(doc.gap_summary.top_gaps)
+        total_dynamic += doc.static_analysis_limits.dynamic_imports
+        total_unresolved += doc.static_analysis_limits.unresolved_paths
+
+    from lattice.shadow.schema import GapSummary, StaticAnalysisLimits
+
+    merged = DirDoc(
+        directory=docs[0].directory,
+        confidence=round(confidence_sum / len(docs), 2),
+        source="agent",
+        confidence_factors=_dedup(all_confidence_factors),
+        last_analyzed=datetime.now(timezone.utc),
+        summary=" ".join(s for s in summaries if s),
+        responsibilities=_dedup(all_responsibilities),
+        developer_hints=_dedup(all_hints),
+        child_refs=_dedup(all_child_refs),
+        cross_cutting_refs=_dedup(all_cross_cutting),
+        integration_points=all_integration,
+        gap_summary=GapSummary(untested_edges=total_untested, top_gaps=all_top_gaps),
+        static_analysis_limits=StaticAnalysisLimits(
+            dynamic_imports=total_dynamic, unresolved_paths=total_unresolved
+        ),
+    )
+
+    all_stubs: list[dict] = []
+    for stubs in test_stubs_lists:
+        all_stubs.extend(stubs)
+
+    return merged, all_stubs[:3]
 
 
 class FleetDispatcher:
@@ -204,7 +408,11 @@ class FleetDispatcher:
         prompt_angle: str = "default",
         idk_mode: bool = False,
     ) -> AgentResult:
-        """Run one LLM investigation pass for a directory.
+        """Run one LLM investigation pass for a directory, splitting if needed.
+
+        Estimates output tokens and splits the directory's files into chunks
+        when the estimate exceeds the budget ceiling. Each chunk gets its own
+        LLM call, and results are merged into a single DirDoc.
 
         Does NOT acquire the semaphore — caller is responsible for concurrency control.
         Includes the retry loop with exponential backoff.
@@ -213,6 +421,115 @@ class FleetDispatcher:
             directory: The directory path to investigate.
             prompt_angle: Prompt angle for angle-differentiated investigation.
             idk_mode: If True, include 2-hop neighbor context in the prompt.
+
+        Returns:
+            AgentResult with investigation outcome.
+        """
+        estimated_output = self._prompt_builder.estimate_output_tokens(
+            directory, self._project_root
+        )
+
+        if estimated_output > _OUTPUT_BUDGET_CEILING:
+            files = self._prompt_builder.collect_file_paths(directory, self._project_root)
+            chunks = _split_files_into_chunks(files)
+
+            if len(chunks) > 1:
+                log.info(
+                    "directory_split",
+                    directory=directory,
+                    chunks=len(chunks),
+                    estimated_output_tokens=estimated_output,
+                    budget=_OUTPUT_BUDGET_CEILING,
+                )
+                return await self._run_chunked_investigation(
+                    directory, chunks, prompt_angle, idk_mode
+                )
+
+        return await self._run_single_llm_call(directory, prompt_angle, idk_mode)
+
+    async def _run_chunked_investigation(
+        self,
+        directory: str,
+        chunks: list[list[Path]],
+        prompt_angle: str,
+        idk_mode: bool,
+    ) -> AgentResult:
+        """Run multiple LLM calls for chunked files and merge results.
+
+        Each chunk builds a prompt containing only its subset of files but
+        retains the full graph/gap/child context for the directory.
+
+        Args:
+            directory: Directory being investigated.
+            chunks: File path lists from _split_files_into_chunks().
+            prompt_angle: Prompt angle for investigation.
+            idk_mode: Whether to include neighbor context.
+
+        Returns:
+            AgentResult with merged DirDoc from all chunks.
+        """
+        partial_docs: list[DirDoc] = []
+        partial_stubs: list[list[dict]] = []
+        total_input = 0
+        total_output = 0
+
+        for i, chunk in enumerate(chunks):
+            log.info(
+                "chunk_dispatch",
+                directory=directory,
+                chunk_index=i,
+                chunk_files=len(chunk),
+                total_chunks=len(chunks),
+            )
+            result = await self._run_single_llm_call(
+                directory, prompt_angle, idk_mode, file_subset=chunk
+            )
+            total_input += result.input_tokens
+            total_output += result.output_tokens
+
+            if result.dir_doc is not None:
+                partial_docs.append(result.dir_doc)
+                partial_stubs.append(result.test_stubs)
+
+        if not partial_docs:
+            return AgentResult(
+                directory=directory,
+                failed=False,
+                error=None,
+                dir_doc=None,
+                test_stubs=[],
+                input_tokens=total_input,
+                output_tokens=total_output,
+            )
+
+        merged_doc, merged_stubs = _merge_dir_docs(partial_docs, partial_stubs)
+        return AgentResult(
+            directory=directory,
+            failed=False,
+            error=None,
+            dir_doc=merged_doc,
+            test_stubs=merged_stubs,
+            input_tokens=total_input,
+            output_tokens=total_output,
+        )
+
+    async def _run_single_llm_call(
+        self,
+        directory: str,
+        prompt_angle: str = "default",
+        idk_mode: bool = False,
+        file_subset: list[Path] | None = None,
+    ) -> AgentResult:
+        """Run one LLM call for a directory (or file subset).
+
+        Does NOT acquire the semaphore — caller is responsible for concurrency control.
+        Includes the retry loop with exponential backoff.
+
+        Args:
+            directory: The directory path to investigate.
+            prompt_angle: Prompt angle for angle-differentiated investigation.
+            idk_mode: If True, include 2-hop neighbor context in the prompt.
+            file_subset: If provided, only include these files in the prompt.
 
         Returns:
             AgentResult with investigation outcome.
@@ -229,6 +546,7 @@ class FleetDispatcher:
                     agent_docs_root=self._agent_docs_root,
                     idk_mode=idk_mode,
                     prompt_angle=prompt_angle,
+                    file_subset=file_subset,
                 )
 
                 model = self._get_model()
@@ -236,7 +554,7 @@ class FleetDispatcher:
 
                 input_tokens, output_tokens = _extract_token_usage(response)
                 dir_doc, test_stubs = _parse_agent_response(
-                    str(response.content), directory
+                    _extract_text_content(response.content), directory
                 )
 
                 log.info(

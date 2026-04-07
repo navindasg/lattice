@@ -27,7 +27,7 @@ class ModelTierConfig(BaseModel):
     provider: str  # "anthropic" | "openai" | "ollama"
     model: str
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     base_url: str | None = None
 
 

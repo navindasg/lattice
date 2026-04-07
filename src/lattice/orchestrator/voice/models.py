@@ -41,7 +41,7 @@ class VoiceConfig(BaseModel):
 
     model_config = {"frozen": True}
 
-    hotkey: str = "<f13>"
+    hotkey: str = "<cmd_r>"
     model_size: str = "small.en"
     confidence_threshold: float = -0.6
     min_duration_ms: int = 300
