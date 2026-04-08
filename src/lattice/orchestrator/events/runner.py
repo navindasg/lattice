@@ -54,6 +54,22 @@ class EventServer:
         """The underlying FastAPI application."""
         return self._app
 
+    @property
+    def is_serving(self) -> bool:
+        """True if the background server task is still running."""
+        if self._serve_task is None:
+            return False
+        return not self._serve_task.done()
+
+    @property
+    def serve_error(self) -> BaseException | None:
+        """Return the exception from the server task, or None if healthy."""
+        if self._serve_task is None or not self._serve_task.done():
+            return None
+        if self._serve_task.cancelled():
+            return None
+        return self._serve_task.exception()
+
     async def start(self) -> asyncio.Queue:
         """Start the UDS server and drain any spooled events.
 

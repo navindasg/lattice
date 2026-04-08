@@ -200,7 +200,7 @@ class TestOrchestratorRunnerMonitor:
                 raise
 
         with patch("asyncio.wait_for", side_effect=_fast_wait_for):
-            await runner._monitor_processes()
+            await runner._monitor_health()
 
         assert call_count == 1
 
@@ -227,6 +227,6 @@ class TestOrchestratorRunnerMonitor:
                 raise
 
         with patch("asyncio.wait_for", side_effect=_fast_wait_for):
-            await runner._monitor_processes()
+            await runner._monitor_health()
 
         assert runner._shutdown_event.is_set()
