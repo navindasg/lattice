@@ -33,6 +33,7 @@ dependencies = [
     "mattermostautodriver>=11.5",
     "mcp>=1.26",
     "libtmux>=0.37",
+    "textual>=3.0",
 ]
 
 [project.scripts]

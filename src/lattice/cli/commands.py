@@ -138,6 +138,11 @@ cli.add_command(orchestrator_install_hooks)
 cli.add_command(orchestrator_uninstall_hooks)
 cli.add_command(orchestrator_check_hooks)
 
+# Register UI commands
+from lattice.cli.ui_commands import ui_dashboard  # noqa: E402
+
+cli.add_command(ui_dashboard)
+
 
 def _walk_files(target: Path) -> list[Path]:
     """Recursively walk target, collecting source files while skipping common dirs."""

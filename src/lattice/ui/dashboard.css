@@ -1,0 +1,63 @@
+/* Lattice TUI Dashboard — main layout stylesheet.
+ *
+ * Layout: sidebar (left, fixed width) + terminal grid (right, flex)
+ * with a status bar docked to the bottom.
+ */
+
+Screen {
+    layout: horizontal;
+    background: $surface;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────── */
+
+#sidebar {
+    width: 38;
+    min-width: 30;
+    max-width: 50;
+    height: 100%;
+    dock: left;
+    border-right: tall $surface-lighten-2;
+    background: $panel;
+    layout: vertical;
+}
+
+/* ── Main Content ────────────────────────────────────────── */
+
+#main-content {
+    width: 1fr;
+    height: 100%;
+    layout: vertical;
+}
+
+/* ── Terminal Grid ───────────────────────────────────────── */
+
+#terminal-grid {
+    height: 1fr;
+    width: 100%;
+}
+
+/* ── Status Bar ──────────────────────────────────────────── */
+
+#status-bar {
+    dock: bottom;
+    height: 1;
+    width: 100%;
+    background: $primary-darken-1;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+}
+
+/* ── Title Bar ───────────────────────────────────────────── */
+
+#title-bar {
+    dock: top;
+    height: 1;
+    width: 100%;
+    background: $primary;
+    color: $text;
+    text-style: bold;
+    content-align: center middle;
+    padding: 0 1;
+}
