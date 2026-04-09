@@ -63,12 +63,18 @@ def orchestrator_init(ctx: click.Context, as_json: bool, soul_dir: str | None) -
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--soul-dir", default=None, help="Override soul directory path")
 @click.option("--db-path", default=".lattice/orchestrator.duckdb", help="DuckDB path")
+@click.option(
+    "--initial-task",
+    default=None,
+    help="Task to inject into the agent event loop on startup.",
+)
 @click.pass_context
 def orchestrator_start(
     ctx: click.Context,
     as_json: bool,
     soul_dir: str | None,
     db_path: str,
+    initial_task: str | None,
 ) -> None:
     """Start the orchestrator: event server, agent, terminal detection.
 
@@ -84,6 +90,7 @@ def orchestrator_start(
         db_path=db_path,
         soul_dir=soul_dir or ".lattice/soul",
         voice_enabled=False,
+        initial_task=initial_task,
     )
 
     try:

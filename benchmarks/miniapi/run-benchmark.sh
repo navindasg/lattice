@@ -3,22 +3,21 @@
 # run-benchmark.sh — Full scripted miniapi benchmark for Lattice orchestrator.
 #
 # This script:
-#   1. Resets the miniapi project to stub state (git checkout)
-#   2. Verifies all tests are RED (baseline)
-#   3. Starts tmux session with N Claude Code instances
-#   4. Initializes the Lattice orchestrator
-#   5. Launches the TUI dashboard (optional, in a split pane)
-#   6. Prints the voice command to speak
-#   7. Waits for user signal that work is complete
-#   8. Runs the scoring agent
-#   9. Records results to results/ directory
+#   1. Loads .env for API keys
+#   2. Verifies module stubs and baseline tests are RED
+#   3. Starts the orchestrator (uses PTYBackend — no tmux required)
+#   4. Sends task assignment to spawn 6 CC instances
+#   5. Optionally launches the native desktop dashboard
+#   6. Waits for user signal that work is complete
+#   7. Runs the scoring agent
+#   8. Records results to results/ directory
 #
 # Usage:
 #   ./run-benchmark.sh [OPTIONS]
 #
 # Options:
 #   --instances N     Number of CC instances to spawn (default: 6)
-#   --dashboard       Also launch the TUI dashboard
+#   --dashboard       Also launch the native desktop dashboard
 #   --auto-score      Skip waiting for user, score after timeout
 #   --timeout MINS    Auto-score timeout in minutes (default: 30)
 #   --help            Show this help
@@ -26,11 +25,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SESSION_NAME="miniapi-bench"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NUM_INSTANCES=6
 DASHBOARD=false
 AUTO_SCORE=false
 TIMEOUT_MINS=30
+
+# Cleanup tracking
+ORCH_PID=""
+DASH_PID=""
+
+cleanup() {
+    if [[ -n "$ORCH_PID" ]]; then
+        kill "$ORCH_PID" 2>/dev/null || true
+        wait "$ORCH_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$DASH_PID" ]]; then
+        kill "$DASH_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Color helpers
@@ -70,11 +84,40 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
+# Load environment
+# ---------------------------------------------------------------------------
+info "Loading environment..."
+
+# Load .env from repo root (where API keys live)
+if [[ -f "$REPO_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/.env"
+    set +a
+    ok "Loaded .env from $REPO_ROOT/.env"
+elif [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+    ok "Loaded .env from $SCRIPT_DIR/.env"
+else
+    warn "No .env file found — ensure ANTHROPIC_API_KEY is set in environment"
+fi
+
+# Verify API key is available
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    err "ANTHROPIC_API_KEY is not set. Add it to $REPO_ROOT/.env or export it."
+    exit 1
+fi
+ok "ANTHROPIC_API_KEY is set (${#ANTHROPIC_API_KEY} chars)"
+
+# ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
 info "Checking prerequisites..."
 
-for cmd in tmux uv; do
+for cmd in uv; do
     if ! command -v "$cmd" &>/dev/null; then
         err "$cmd is required but not installed"
         exit 1
@@ -82,18 +125,17 @@ for cmd in tmux uv; do
 done
 
 if ! command -v claude &>/dev/null; then
-    warn "claude CLI not found — orchestrator cc_spawn will need it on PATH"
+    warn "claude CLI not found — cc_spawn requires it on PATH"
 fi
 
 ok "All prerequisites found"
 
 # ---------------------------------------------------------------------------
-# Step 1: Reset to stub state
+# Step 1: Verify stubs
 # ---------------------------------------------------------------------------
-info "Resetting miniapi to stub state..."
+info "Verifying module stubs..."
 cd "$SCRIPT_DIR"
 
-# Verify stubs are in place (router-only, no endpoints)
 for mod in users projects tasks tags search stats; do
     file="src/miniapi/${mod}.py"
     if [[ ! -f "$file" ]]; then
@@ -116,78 +158,83 @@ ok "Baseline verified: all tests RED"
 # ---------------------------------------------------------------------------
 # Step 3: Resolve lattice CLI
 # ---------------------------------------------------------------------------
-LATTICE_PKG="$(cd "$SCRIPT_DIR/../.." && pwd)"
+LATTICE_CMD="uv run --directory $REPO_ROOT lattice"
 if command -v lattice &>/dev/null; then
     LATTICE_CMD="lattice"
-else
-    LATTICE_CMD="uv run --directory $LATTICE_PKG lattice"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Create tmux session and start orchestrator
+# Step 4: Initialize soul ecosystem
 # ---------------------------------------------------------------------------
-if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    warn "Session '$SESSION_NAME' exists, killing it"
-    tmux kill-session -t "$SESSION_NAME"
-fi
-
-info "Creating tmux session: $SESSION_NAME"
-tmux new-session -d -s "$SESSION_NAME" -c "$SCRIPT_DIR"
-
-# Initialize soul ecosystem
-info "Initializing Lattice orchestrator..."
+info "Initializing soul ecosystem..."
 $LATTICE_CMD orchestrator:init --soul-dir "$SCRIPT_DIR/.lattice/soul" 2>/dev/null || true
 ok "Soul ecosystem initialized"
 
-# Start the orchestrator with voice in the tmux session.
-# The orchestrator's cc_spawn tool will create CC instances on demand
-# when instructed via voice command.
-info "Starting orchestrator in tmux session..."
-ORCH_CMD="$LATTICE_CMD orchestrator:voice --soul-dir '$SCRIPT_DIR/.lattice/soul' --project '$SCRIPT_DIR'"
-tmux send-keys -t "$SESSION_NAME" "$ORCH_CMD" Enter
-ok "Orchestrator starting (voice mode)"
-
-# Give the orchestrator a moment to initialize
-info "Waiting for orchestrator to initialize..."
-sleep 5
+# ---------------------------------------------------------------------------
+# Step 5: Build task message
+# ---------------------------------------------------------------------------
+TASK_MSG="There are ${NUM_INSTANCES} tickets in the ${SCRIPT_DIR}/tickets/ directory. \
+Spawn ${NUM_INSTANCES} Claude Code instances and assign one ticket to each. \
+Each instance should read its ticket file and implement the module. \
+The project directory is ${SCRIPT_DIR}."
 
 # ---------------------------------------------------------------------------
-# Step 5: Dashboard (optional)
+# Step 6: Start orchestrator with initial task (background, PTYBackend)
+# ---------------------------------------------------------------------------
+info "Starting orchestrator with task assignment..."
+cd "$SCRIPT_DIR"
+
+# Clean up stale socket if present
+rm -f "$HOME/.lattice/orchestrator.sock"
+
+$LATTICE_CMD orchestrator:start \
+    --soul-dir "$SCRIPT_DIR/.lattice/soul" \
+    --db-path "$SCRIPT_DIR/.lattice/orchestrator.duckdb" \
+    --initial-task "$TASK_MSG" &
+ORCH_PID=$!
+
+# Give the orchestrator time to initialize and inject the task
+info "Waiting for orchestrator to initialize..."
+sleep 10
+
+# Check it's still running
+if ! kill -0 "$ORCH_PID" 2>/dev/null; then
+    err "Orchestrator failed to start — check logs above"
+    ORCH_PID=""
+    exit 1
+fi
+ok "Orchestrator running (PID: $ORCH_PID) — task injected"
+
+# ---------------------------------------------------------------------------
+# Step 7: Dashboard (optional)
 # ---------------------------------------------------------------------------
 if [[ "$DASHBOARD" == "true" ]]; then
     info "Launching native desktop dashboard..."
     cols=$((NUM_INSTANCES < 3 ? NUM_INSTANCES : 3))
-    # Launch the native pywebview dashboard as a detached background process.
-    # - >/dev/null 2>&1 suppresses debug polling logs from mixing with output
-    # - disown removes the process from bash's job table so Ctrl+C and script
-    #   exit don't send signals to it (prevents the GIL/Cocoa crash)
-    # - The dashboard window appears as a native macOS window on screen
-    $LATTICE_CMD ui:dashboard --cols "$cols" --soul-dir "$SCRIPT_DIR/.lattice/soul" >/dev/null 2>&1 &
+    $LATTICE_CMD ui:dashboard \
+        --cols "$cols" \
+        --soul-dir "$SCRIPT_DIR/.lattice/soul" \
+        --interactive >/dev/null 2>&1 &
     DASH_PID=$!
     disown "$DASH_PID"
     ok "Native dashboard window opened (PID: $DASH_PID)"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Print voice command
+# Step 8: Status and wait
 # ---------------------------------------------------------------------------
 echo ""
 echo "=================================================================="
-printf "${BOLD}${GREEN}  BENCHMARK READY${NC}\n"
+printf "${BOLD}${GREEN}  BENCHMARK RUNNING${NC}\n"
 echo "=================================================================="
 echo ""
-echo "  Orchestrator is running in tmux with voice enabled."
-echo "  Attach with: tmux attach -t $SESSION_NAME"
+echo "  Orchestrator PID: $ORCH_PID"
+echo "  Project: $SCRIPT_DIR"
 echo ""
-printf "${BOLD}  Say this to the orchestrator:${NC}\n"
+echo "  Task: spawn $NUM_INSTANCES CC instances from tickets/"
 echo ""
-printf "  ${CYAN}\"There are 6 tickets in the tickets/ directory.${NC}\n"
-printf "  ${CYAN} Spawn 6 Claude Code instances and assign one ticket${NC}\n"
-printf "  ${CYAN} to each. Each instance should read its ticket and${NC}\n"
-printf "  ${CYAN} implement the module. The project directory is $(pwd).\"${NC}\n"
-echo ""
-echo "  The orchestrator will use cc_spawn to create each instance"
-echo "  and send the ticket assignment as the first prompt."
+echo "  Monitor progress:"
+echo "    $LATTICE_CMD orchestrator:status --soul-dir '$SCRIPT_DIR/.lattice/soul'"
 echo ""
 echo "  Ticket files:"
 for f in tickets/*.md; do
@@ -196,9 +243,6 @@ done
 echo ""
 echo "=================================================================="
 
-# ---------------------------------------------------------------------------
-# Step 7: Wait for completion
-# ---------------------------------------------------------------------------
 if [[ "$AUTO_SCORE" == "true" ]]; then
     info "Auto-score enabled. Waiting ${TIMEOUT_MINS}m..."
     sleep $((TIMEOUT_MINS * 60))
@@ -209,12 +253,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8: Score
+# Step 9: Score
 # ---------------------------------------------------------------------------
 info "Running scoring agent..."
 echo ""
 
-# Create results directory
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -230,12 +273,7 @@ ok "Results saved to results/score-${TIMESTAMP}.txt"
 ok "JSON results: results/score-${TIMESTAMP}.json"
 
 # ---------------------------------------------------------------------------
-# Step 9: Cleanup
+# Step 10: Cleanup (trap handles ORCH_PID and DASH_PID)
 # ---------------------------------------------------------------------------
-if [[ "${DASH_PID:-}" ]]; then
-    kill "$DASH_PID" 2>/dev/null || true
-fi
-
 echo ""
-printf "  Cleanup: ${BOLD}tmux kill-session -t $SESSION_NAME${NC}\n"
-echo ""
+info "Shutting down orchestrator..."

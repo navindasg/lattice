@@ -28,8 +28,9 @@ from lattice.orchestrator.soul_ecosystem.writer import SoulWriter
 
 logger = structlog.get_logger(__name__)
 
-# Maximum time to process a single event before timing out
-_EVENT_PROCESSING_TIMEOUT = 10.0
+# Maximum time to process a single event before timing out.
+# Must be generous enough for cc_spawn (PTY spawn + 2s init delay + LLM calls).
+_EVENT_PROCESSING_TIMEOUT = 120.0
 
 
 class AgentEventLoop:
@@ -198,6 +199,9 @@ class AgentEventLoop:
             if len(input_summary) > 500:
                 input_summary = input_summary[:500] + "..."
             parts.append(f"Input: {input_summary}")
+
+        if event.tool_response:
+            parts.append(f"Message: {event.tool_response}")
 
         if event.cwd:
             parts.append(f"CWD: {event.cwd}")

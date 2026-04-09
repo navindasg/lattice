@@ -86,10 +86,12 @@ class OrchestratorRunner:
         voice_enabled: bool = True,
         terminal_backend: Any | None = None,
         llm_model: Any | None = None,
+        initial_task: str | None = None,
     ) -> None:
         self._project_root = project_root
         self._db_path = db_path
         self._soul_dir_path = Path(project_root) / soul_dir
+        self._initial_task = initial_task
         self._sock_path = sock_path or _DEFAULT_SOCK_PATH
         self._orch_config = orchestrator_config or OrchestratorConfig()
         self._voice_config = voice_config or VoiceConfig()
@@ -262,6 +264,27 @@ class OrchestratorRunner:
             if self._voice_enabled:
                 log.info("voice_listener_ready")
 
+            # Inject initial task as a synthetic event if provided
+            if self._initial_task:
+                from datetime import datetime, timezone
+                from lattice.orchestrator.events.models import CCEvent
+
+                synthetic = CCEvent(
+                    session_id="initial-task",
+                    event_type="TaskAssignment",
+                    tool_name=None,
+                    tool_input=None,
+                    tool_response=self._initial_task,
+                    transcript_path=None,
+                    cwd=self._project_root,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                await event_queue.put(synthetic)
+                log.info(
+                    "initial_task_injected",
+                    task=self._initial_task[:100],
+                )
+
             # Wait for shutdown signal or task failure
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
@@ -334,6 +357,15 @@ class OrchestratorRunner:
                         error=str(exc),
                     )
 
+        # Shut down PTY backend if applicable
+        try:
+            from lattice.orchestrator.terminal.pty_backend import PTYBackend
+            if isinstance(self._terminal_backend, PTYBackend):
+                self._terminal_backend.shutdown()
+                log.info("pty_backend_shutdown")
+        except Exception as exc:
+            log.warning("shutdown_pty_error", error=str(exc))
+
         # Ensure socket file is removed even if event server didn't clean up
         if self._sock_path.exists():
             self._sock_path.unlink(missing_ok=True)
@@ -353,35 +385,45 @@ class OrchestratorRunner:
     async def _detect_cc_instances(self) -> list[Any]:
         """Detect CC instances via terminal backend.
 
-        If no terminal backend is available (no tmux), logs a warning and
-        returns an empty list. Updates the instance_pane_map.
+        Uses PTYBackend by default (direct PTY management). Falls back
+        to TmuxBackend if PTYBackend is not available.
 
         Returns:
             List of CCInstance objects detected.
         """
         if self._terminal_backend is None:
             try:
-                from lattice.orchestrator.terminal.tmux import TmuxBackend
-                self._terminal_backend = TmuxBackend()
-            except RuntimeError as exc:
-                error_msg = str(exc)
-                if "No tmux server" in error_msg:
-                    log.error("no_tmux_server")
-                    raise SystemExit(
-                        "No tmux server found. Start tmux and launch "
-                        "Claude Code instances first."
-                    ) from exc
-                raise
+                from lattice.orchestrator.terminal.pty_backend import PTYBackend
+                from lattice.ui.pty_manager import PTYManager
+
+                pty_mgr = PTYManager()
+                self._terminal_backend = PTYBackend(pty_mgr)
+                log.info("terminal_backend.pty_initialized")
+            except Exception as exc:
+                log.warning(
+                    "pty_backend_init_failed",
+                    error=str(exc),
+                    hint="Falling back to TmuxBackend",
+                )
+                try:
+                    from lattice.orchestrator.terminal.tmux import TmuxBackend
+                    self._terminal_backend = TmuxBackend()
+                except RuntimeError as tmux_exc:
+                    error_msg = str(tmux_exc)
+                    if "No tmux server" in error_msg:
+                        log.error("no_terminal_backend")
+                        raise SystemExit(
+                            "No terminal backend available. "
+                            "PTYBackend failed and no tmux server found."
+                        ) from tmux_exc
+                    raise
 
         instances = await self._terminal_backend.detect_cc_panes()
 
         if not instances:
-            log.warning(
+            log.info(
                 "no_cc_instances_detected",
-                hint=(
-                    "No Claude Code instances detected. Use cc_spawn to "
-                    "create one, or start CC in a tmux pane."
-                ),
+                hint="Use cc_spawn to create Claude Code instances.",
             )
 
         # Build instance → pane map for agent tools (immutable rebuild)
@@ -405,10 +447,23 @@ class OrchestratorRunner:
         model = self._llm_model
         if model is None:
             from langchain_anthropic import ChatAnthropic
+            from lattice.llm.config import LatticeSettings
+
+            settings = LatticeSettings()
+            api_key = settings.anthropic_api_key
+            if not api_key:
+                import os
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise SystemExit(
+                    "ANTHROPIC_API_KEY not set. Add it to .env or export it."
+                )
+
             model = ChatAnthropic(
                 model="claude-sonnet-4-6",
                 temperature=0.0,
                 max_tokens=8192,
+                api_key=api_key,
             )
 
         graph = build_orchestrator_graph(

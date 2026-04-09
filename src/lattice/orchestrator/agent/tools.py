@@ -259,12 +259,17 @@ def cc_spawn(project: str, task: str) -> dict[str, Any]:
         Dict with new instance details.
     """
     ctx = get_tool_context()
+    logger.info("cc_spawn.invoked", project=project, task=task[:80])
 
     # Sanitize project path to prevent shell injection
     safe_project = shlex.quote(project)
-    pane_id = _run_async(
-        ctx.terminal.spawn_pane(f"cd {safe_project} && claude", name=f"cc-{project}")
-    )
+    try:
+        pane_id = _run_async(
+            ctx.terminal.spawn_pane(f"cd {safe_project} && claude", name=f"cc-{project}")
+        )
+    except Exception as exc:
+        logger.error("cc_spawn.spawn_failed", error=str(exc), project=project)
+        return {"success": False, "error": f"Failed to spawn: {exc}"}
 
     # Detect instance number
     instances = _run_async(ctx.terminal.detect_cc_panes())
