@@ -7,10 +7,14 @@ The Python DashboardAPI class is exposed to JavaScript via
 ``window.pywebview.api``.  A background thread polls
 DashboardService.poll_full_snapshot() every second and pushes
 serialized JSON to the frontend via ``window.evaluate_js()``.
+
+Terminal panes are managed by PTYManager (direct PTY control) and
+rendered in the frontend via xterm.js.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from dataclasses import asdict
@@ -20,6 +24,7 @@ from typing import Any
 import structlog
 import webview
 
+from lattice.ui.pty_manager import PTYManager, TerminalStatus
 from lattice.ui.services import DashboardService, DashboardSnapshot
 
 log = structlog.get_logger(__name__)
@@ -67,6 +72,9 @@ class DashboardAPI:
 
     Methods on this class are callable from JavaScript as:
         window.pywebview.api.method_name(args)
+
+    Terminal management is handled by PTYManager.  Output from terminals
+    is pushed to the frontend via evaluate_js() callbacks.
     """
 
     def __init__(
@@ -81,6 +89,55 @@ class DashboardAPI:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._capture: Any | None = None
         self._pipeline: Any | None = None
+        self._window: webview.Window | None = None
+        self._pty_manager: PTYManager | None = None
+
+    def _init_pty_manager(self) -> None:
+        """Initialize the PTYManager with output/exit callbacks wired
+        to push data to the frontend via evaluate_js.
+        """
+        self._pty_manager = PTYManager(
+            on_output=self._on_terminal_output,
+            on_exit=self._on_terminal_exit,
+        )
+
+    def _on_terminal_output(self, pane_id: str, data: bytes) -> None:
+        """Callback invoked by PTYManager reader threads on new output.
+
+        Encodes binary data as base64 and pushes it to the frontend
+        via evaluate_js.  Thread-safe.
+        """
+        if self._window is None:
+            return
+
+        b64 = base64.b64encode(data).decode("ascii")
+        safe_pane_id = json.dumps(pane_id)
+        safe_data = json.dumps(b64)
+
+        try:
+            self._window.evaluate_js(
+                f"window.__terminalOutput && window.__terminalOutput({safe_pane_id}, {safe_data});"
+            )
+        except Exception as exc:
+            log.debug("api.terminal_output_push_failed", pane_id=pane_id, error=str(exc))
+
+    def _on_terminal_exit(self, pane_id: str, exit_code: int | None) -> None:
+        """Callback invoked by PTYManager when a terminal process exits.
+
+        Pushes exit notification to the frontend via evaluate_js.
+        """
+        if self._window is None:
+            return
+
+        safe_pane_id = json.dumps(pane_id)
+        safe_code = json.dumps(exit_code)
+
+        try:
+            self._window.evaluate_js(
+                f"window.__terminalExited && window.__terminalExited({safe_pane_id}, {safe_code});"
+            )
+        except Exception:
+            pass
 
     @property
     def config(self) -> dict[str, Any]:
@@ -112,6 +169,159 @@ class DashboardAPI:
         except Exception as exc:
             log.error("api.poll_snapshot_failed", error=str(exc))
             return json.dumps({"error": str(exc)})
+
+    # ------------------------------------------------------------------
+    # Terminal management (PTY-backed)
+    # ------------------------------------------------------------------
+
+    def spawn_terminal(self, cmd_json: str | None = None) -> str:
+        """Spawn a new PTY-backed terminal process.
+
+        Args:
+            cmd_json: JSON string of {"cmd": [...], "cwd": "...", "cols": N, "rows": N}.
+                      All fields optional.  Defaults to user's shell in home dir.
+
+        Returns:
+            JSON string with {pane_id, success} or {error, success: false}.
+        """
+        if self._pty_manager is None:
+            return json.dumps({"success": False, "error": "PTYManager not initialized"})
+
+        try:
+            params: dict[str, Any] = {}
+            if cmd_json:
+                parsed = json.loads(cmd_json) if isinstance(cmd_json, str) else cmd_json
+                if isinstance(parsed, dict):
+                    params = parsed
+
+            # Validate cmd is a list of strings if provided
+            cmd = params.get("cmd")
+            if cmd is not None:
+                if not isinstance(cmd, list) or not all(isinstance(c, str) for c in cmd):
+                    return json.dumps({"success": False, "error": "cmd must be a list of strings"})
+
+            # Validate cwd exists if provided
+            cwd = params.get("cwd")
+            if cwd is not None:
+                import os
+                cwd = os.path.realpath(str(cwd))
+                if not os.path.isdir(cwd):
+                    return json.dumps({"success": False, "error": "Invalid working directory"})
+
+            # Validate dimensions
+            cols = int(params.get("cols", 80))
+            rows = int(params.get("rows", 24))
+            cols = max(1, min(500, cols))
+            rows = max(1, min(200, rows))
+
+            pane_id = self._pty_manager.spawn(
+                cmd=cmd,
+                cwd=cwd,
+                cols=cols,
+                rows=rows,
+            )
+            return json.dumps({"success": True, "pane_id": pane_id})
+        except Exception as exc:
+            log.error("api.spawn_terminal_failed", error=str(exc))
+            return json.dumps({"success": False, "error": str(exc)})
+
+    def write_terminal(self, pane_id: str, data: str) -> str:
+        """Write input data to a terminal's PTY.
+
+        Args:
+            pane_id: Terminal identifier from spawn_terminal().
+            data: Base64-encoded input bytes.
+
+        Returns:
+            JSON string with {success} or {error, success: false}.
+        """
+        if self._pty_manager is None:
+            return json.dumps({"success": False, "error": "PTYManager not initialized"})
+
+        try:
+            raw = base64.b64decode(data)
+            self._pty_manager.write(pane_id, raw)
+            return json.dumps({"success": True})
+        except Exception as exc:
+            log.error("api.write_terminal_failed", pane_id=pane_id, error=str(exc))
+            return json.dumps({"success": False, "error": str(exc)})
+
+    def resize_terminal(self, pane_id: str, cols: int, rows: int) -> str:
+        """Resize a terminal's PTY.
+
+        Args:
+            pane_id: Terminal identifier from spawn_terminal().
+            cols: New column count.
+            rows: New row count.
+
+        Returns:
+            JSON string with {success} or {error, success: false}.
+        """
+        if self._pty_manager is None:
+            return json.dumps({"success": False, "error": "PTYManager not initialized"})
+
+        try:
+            cols = max(1, min(500, int(cols)))
+            rows = max(1, min(200, int(rows)))
+            self._pty_manager.resize(pane_id, cols, rows)
+            return json.dumps({"success": True})
+        except Exception as exc:
+            log.error("api.resize_terminal_failed", pane_id=pane_id, error=str(exc))
+            return json.dumps({"success": False, "error": str(exc)})
+
+    def kill_terminal(self, pane_id: str) -> str:
+        """Kill a terminal process and clean up its PTY.
+
+        Args:
+            pane_id: Terminal identifier from spawn_terminal().
+
+        Returns:
+            JSON string with {success} or {error, success: false}.
+        """
+        if self._pty_manager is None:
+            return json.dumps({"success": False, "error": "PTYManager not initialized"})
+
+        try:
+            self._pty_manager.kill(pane_id)
+            return json.dumps({"success": True})
+        except Exception as exc:
+            log.error("api.kill_terminal_failed", pane_id=pane_id, error=str(exc))
+            return json.dumps({"success": False, "error": str(exc)})
+
+    def list_terminals(self) -> str:
+        """List all managed terminal processes.
+
+        Returns:
+            JSON string with {terminals: [...], success: true}.
+        """
+        if self._pty_manager is None:
+            return json.dumps({"success": True, "terminals": []})
+
+        try:
+            terminals = self._pty_manager.list_terminals()
+            return json.dumps({
+                "success": True,
+                "terminals": [
+                    {
+                        "pane_id": t.pane_id,
+                        "cmd": list(t.cmd),
+                        "cwd": t.cwd,
+                        "pid": t.pid,
+                        "status": t.status.value,
+                        "exit_code": t.exit_code,
+                        "cols": t.cols,
+                        "rows": t.rows,
+                    }
+                    for t in terminals
+                ],
+            })
+        except Exception as exc:
+            log.error("api.list_terminals_failed", error=str(exc))
+            return json.dumps({"success": False, "error": str(exc)})
+
+    # ------------------------------------------------------------------
+    # Voice / text commands
+    # ------------------------------------------------------------------
 
     def send_text_command(self, text: str) -> str:
         """Process a text command through the voice pipeline.
@@ -303,7 +513,8 @@ def launch_dashboard(
 
     This is the main entry point called by the CLI command.
     It creates an async event loop in a background thread,
-    initializes the DashboardService, and opens the native window.
+    initializes the DashboardService and PTYManager, and opens
+    the native window.
 
     Args:
         soul_dir: Path to the soul ecosystem directory.
@@ -320,6 +531,9 @@ def launch_dashboard(
 
     loop = asyncio.new_event_loop()
     api._loop = loop
+
+    # Initialize PTY manager with callbacks wired to the frontend
+    api._init_pty_manager()
 
     async_thread = threading.Thread(
         target=_run_async_loop,
@@ -341,6 +555,9 @@ def launch_dashboard(
         text_select=True,
     )
 
+    # Store window reference for PTY output callbacks
+    api._window = window
+
     poller: _Poller | None = None
 
     def _on_loaded() -> None:
@@ -360,6 +577,10 @@ def launch_dashboard(
         poller.start()
 
     def _on_closed() -> None:
+        # Shut down PTY manager first
+        if api._pty_manager is not None:
+            api._pty_manager.shutdown()
+
         if poller is not None:
             poller.stop()
         future = asyncio.run_coroutine_threadsafe(service.close(), loop)
