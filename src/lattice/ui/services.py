@@ -4,23 +4,21 @@ Provides async polling services that decouple UI widgets from direct
 backend calls.  Each service method is a coroutine that can be called
 from Textual workers or timers.
 
-Thread safety: DuckDB connections are not thread-safe.  All DB access
-is serialized through a threading.Lock and dispatched to the default
-executor so the Textual event loop is never blocked.
+Event data is fetched via HTTP over the orchestrator's Unix domain
+socket (EventServer API), not by opening DuckDB directly.  This avoids
+lock conflicts with the running orchestrator process.
 """
 from __future__ import annotations
 
 import asyncio
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-import duckdb
+import httpx
 import structlog
 
-from lattice.orchestrator.events.persistence import get_history, init_events_table
 from lattice.orchestrator.soul_ecosystem.models import (
     OrchestratorState,
     SoulMemoryEntry,
@@ -29,6 +27,8 @@ from lattice.orchestrator.soul_ecosystem.reader import SoulReader
 from lattice.orchestrator.terminal.models import CCInstance
 
 log = structlog.get_logger(__name__)
+
+_DEFAULT_SOCK_PATH = Path.home() / ".lattice" / "orchestrator.sock"
 
 
 @dataclass(frozen=True)
@@ -61,63 +61,63 @@ class DashboardSnapshot:
 class DashboardService:
     """Async service layer for polling all Lattice backend sources.
 
-    Constructed with paths and optional db connection.  All public
-    methods are async and safe to call from Textual workers.
-
-    DuckDB access is serialized via threading.Lock and dispatched to
-    a thread pool executor to avoid blocking the event loop.
+    Reads events from the orchestrator's EventServer via HTTP over
+    its Unix domain socket.  Reads soul state from the filesystem.
+    Reads terminal state from tmux via the TmuxBackend.
     """
 
     def __init__(
         self,
         soul_dir: Path,
-        db_path: str = ".lattice/orchestrator.duckdb",
+        sock_path: Path | None = None,
     ) -> None:
         self._soul_dir = soul_dir
-        self._db_path = db_path
+        self._sock_path = sock_path or _DEFAULT_SOCK_PATH
         self._reader = SoulReader(soul_dir)
-        self._db_conn: duckdb.DuckDBPyConnection | None = None
         self._backend: Any | None = None
-        self._db_lock = threading.Lock()
-
-    @property
-    def db_conn(self) -> duckdb.DuckDBPyConnection | None:
-        """Expose the DB connection for subsystems that need it."""
-        return self._db_conn
+        self._http: httpx.AsyncClient | None = None
 
     async def initialize(self) -> None:
-        """Open database connection and initialize terminal backend.
+        """Initialize HTTP client and terminal backend.
 
-        All blocking operations are dispatched to the executor so the
-        event loop is never blocked.  Safe to call multiple times.
+        The HTTP client connects to the orchestrator's UDS socket
+        for event queries.  If the socket isn't available yet, events
+        will gracefully return empty until it appears.
+
+        Safe to call multiple times — idempotent.
         """
-        if self._db_conn is None:
-            loop = asyncio.get_running_loop()
-
-            def _open_db() -> duckdb.DuckDBPyConnection:
-                db_file = Path(self._db_path)
-                db_file.parent.mkdir(parents=True, exist_ok=True)
-                conn = duckdb.connect(str(db_file))
-                init_events_table(conn)
-                return conn
-
-            self._db_conn = await loop.run_in_executor(None, _open_db)
-            log.info("dashboard_service.db_connected", path=self._db_path)
+        if self._http is None:
+            transport = httpx.AsyncHTTPTransport(uds=str(self._sock_path))
+            self._http = httpx.AsyncClient(
+                transport=transport,
+                base_url="http://lattice-orchestrator",
+                timeout=5.0,
+            )
+            log.info(
+                "dashboard_service.http_client_ready",
+                socket=str(self._sock_path),
+            )
 
         if self._backend is None:
-            try:
+            # Import and construct TmuxBackend in the executor thread.
+            # libtmux reads sys.stdout.encoding at import time, which
+            # fails under Textual's _PrintCapture wrapper on the main
+            # thread.  Running in the executor avoids this.
+            def _init_tmux():
                 from lattice.orchestrator.terminal.tmux import TmuxBackend
-                self._backend = TmuxBackend()
-            except RuntimeError:
+                return TmuxBackend()
+
+            try:
+                loop = asyncio.get_running_loop()
+                self._backend = await loop.run_in_executor(None, _init_tmux)
+            except (RuntimeError, AttributeError):
                 log.warning("dashboard_service.no_tmux")
 
     async def close(self) -> None:
-        """Close database connection and release resources."""
-        if self._db_conn is not None:
-            loop = asyncio.get_running_loop()
-            conn = self._db_conn
-            self._db_conn = None
-            await loop.run_in_executor(None, conn.close)
+        """Close HTTP client and release resources."""
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     async def detect_instances(self) -> list[CCInstance]:
         """Detect live CC instances from tmux."""
@@ -165,30 +165,51 @@ class DashboardService:
         session_id: str | None = None,
         event_type: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Query recent events from DuckDB.
+        """Query recent events via the EventServer HTTP API over UDS.
 
-        Dispatched to executor with threading.Lock to avoid blocking
-        the event loop and to serialize DuckDB access.
+        Hits GET /events/history on the orchestrator's Unix domain socket.
+        Returns empty list if the orchestrator isn't running or the socket
+        doesn't exist yet.
         """
-        if self._db_conn is None:
+        if self._http is None:
             return []
 
-        loop = asyncio.get_running_loop()
-
-        def _query() -> list[dict[str, Any]]:
-            with self._db_lock:
-                return get_history(
-                    self._db_conn,
-                    session_id=session_id,
-                    event_type=event_type,
-                    limit=limit,
-                )
+        params: dict[str, str | int] = {"limit": limit}
+        if session_id is not None:
+            params["session_id"] = session_id
+        if event_type is not None:
+            params["event_type"] = event_type
 
         try:
-            return await loop.run_in_executor(None, _query)
+            resp = await self._http.get("/events/history", params=params)
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.ConnectError, httpx.TimeoutException):
+            # Orchestrator not running yet — this is expected during startup
+            return []
         except Exception as exc:
             log.error("dashboard_service.events_failed", error=str(exc))
             return []
+
+    async def read_health(self) -> HealthSnapshot:
+        """Query health metrics via the EventServer HTTP API over UDS."""
+        if self._http is None:
+            return HealthSnapshot()
+
+        try:
+            resp = await self._http.get("/health")
+            resp.raise_for_status()
+            data = resp.json()
+            return HealthSnapshot(
+                uptime_seconds=data.get("uptime_seconds", 0.0),
+                connected_sessions=data.get("connected_sessions", 0),
+                pending_events=data.get("pending_events", 0),
+            )
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return HealthSnapshot()
+        except Exception as exc:
+            log.error("dashboard_service.health_failed", error=str(exc))
+            return HealthSnapshot()
 
     async def process_text_command(self, text: str) -> dict[str, Any]:
         """Process a text command through the voice pipeline.
@@ -209,7 +230,7 @@ class DashboardService:
             from lattice.orchestrator.voice.router import IntentRouter
 
             if not hasattr(self, "_voice_pipeline") or self._voice_pipeline is None:
-                router = IntentRouter(db_conn=self._db_conn)
+                router = IntentRouter()
                 self._voice_pipeline = VoicePipeline(
                     config=VoiceConfig(), router=router
                 )
@@ -239,9 +260,10 @@ class DashboardService:
         state_task = asyncio.create_task(self.read_soul_state())
         memory_task = asyncio.create_task(self.read_memory())
         events_task = asyncio.create_task(self.read_recent_events(limit=50))
+        health_task = asyncio.create_task(self.read_health())
 
-        instances, state, memory, events = await asyncio.gather(
-            instances_task, state_task, memory_task, events_task
+        instances, state, memory, events, health = await asyncio.gather(
+            instances_task, state_task, memory_task, events_task, health_task
         )
 
         captured: dict[str, tuple[str, ...]] = {}
@@ -259,5 +281,6 @@ class DashboardService:
             soul_state=state,
             memory_entries=tuple(memory),
             recent_events=tuple(events),
+            health=health,
             captured_output=MappingProxyType(captured),
         )

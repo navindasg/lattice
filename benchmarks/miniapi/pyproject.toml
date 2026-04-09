@@ -1,0 +1,25 @@
+[project]
+name = "miniapi"
+version = "0.1.0"
+description = "Lattice orchestrator benchmark — 6-module REST API"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
+    "httpx>=0.24",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q --tb=short"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

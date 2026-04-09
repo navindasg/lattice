@@ -64,13 +64,13 @@ class LatticeDashboard(App):
     def __init__(
         self,
         soul_dir: Path,
-        db_path: str = ".lattice/orchestrator.duckdb",
+        sock_path: Path | None = None,
         columns: int = 3,
         interactive: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self._service = DashboardService(soul_dir=soul_dir, db_path=db_path)
+        self._service = DashboardService(soul_dir=soul_dir, sock_path=sock_path)
         self._columns = columns
         self._interactive = interactive
         self._last_snapshot: DashboardSnapshot | None = None

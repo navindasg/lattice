@@ -1,0 +1,152 @@
+============================================================
+  miniapi Benchmark Scorecard
+============================================================
+
+  Module       Ticket   Pass   Fail   Score  Time    
+  ------------ -------- ------ ------ ------ --------
+  users        01       0      0      ❌      0.30    s
+  projects     02       0      0      ❌      0.28    s
+  tasks        03       0      0      ❌      0.29    s
+  tags         04       0      0      ❌      0.28    s
+  search       05       0      0      ❌      0.29    s
+  stats        06       0      0      ❌      0.28    s
+
+  BONUS        all+hc                 ❌     
+
+  Total Score: 0 / 7 (0%)
+  Duration:    1.73s
+============================================================
+
+Failed modules:
+
+--- users (ticket 01) ---
+  ___________________________ test_get_user_not_found ____________________________
+  tests/test_users.py:28: in test_get_user_not_found
+      assert resp.json()["detail"] == "not found"
+  E   AssertionError: assert 'Not Found' == 'not found'
+  E     
+  E     - not found
+  E     ? ^   ^
+  E     + Not Found
+  E     ? ^   ^
+  _______________________________ test_delete_user _______________________________
+  tests/test_users.py:36: in test_delete_user
+      user_id = create_resp.json()["id"]
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+  E   KeyError: 'id'
+  =========================== short test summary info ============================
+  FAILED tests/test_users.py::test_create_user - assert 404 == 201
+  FAILED tests/test_users.py::test_list_users - assert 404 == 200
+  FAILED tests/test_users.py::test_get_user_not_found - AssertionError: assert ...
+  FAILED tests/test_users.py::test_delete_user - KeyError: 'id'
+  ============================== 4 failed in 0.02s ===============================
+
+--- projects (ticket 02) ---
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  _____________________________ test_delete_project ______________________________
+  tests/test_projects.py:39: in test_delete_project
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  =========================== short test summary info ============================
+  FAILED tests/test_projects.py::test_create_project - assert 404 == 201
+  FAILED tests/test_projects.py::test_create_project_bad_owner - assert 404 == 400
+  FAILED tests/test_projects.py::test_list_projects - assert 404 == 201
+  FAILED tests/test_projects.py::test_delete_project - assert 404 == 201
+  ============================== 4 failed in 0.02s ===============================
+
+--- tasks (ticket 03) ---
+  tests/test_tasks.py:50: in test_delete_task
+      task = await seed_task()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:51: in _seed
+      project = await seed_project()
+                ^^^^^^^^^^^^^^^^^^^^
+  tests/conftest.py:38: in _seed
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  =========================== short test summary info ============================
+  FAILED tests/test_tasks.py::test_create_task - assert 404 == 201
+  FAILED tests/test_tasks.py::test_create_task_bad_project - assert 404 == 400
+  FAILED tests/test_tasks.py::test_patch_task_status - assert 404 == 201
+  FAILED tests/test_tasks.py::test_patch_task_invalid_status - assert 404 == 201
+  FAILED tests/test_tasks.py::test_delete_task - assert 404 == 201
+  ============================== 5 failed in 0.03s ===============================
+
+--- tags (ticket 04) ---
+  __________________________ test_detach_tag_from_task ___________________________
+  tests/test_tags.py:39: in test_detach_tag_from_task
+      task = await seed_task()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:51: in _seed
+      project = await seed_project()
+                ^^^^^^^^^^^^^^^^^^^^
+  tests/conftest.py:38: in _seed
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  =========================== short test summary info ============================
+  FAILED tests/test_tags.py::test_create_tag - assert 404 == 201
+  FAILED tests/test_tags.py::test_create_duplicate_tag - assert 404 == 409
+  FAILED tests/test_tags.py::test_attach_tag_to_task - assert 404 == 201
+  FAILED tests/test_tags.py::test_detach_tag_from_task - assert 404 == 201
+  ============================== 4 failed in 0.02s ===============================
+
+--- search (ticket 05) ---
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  _________________________ test_search_combined_filters _________________________
+  tests/test_search.py:37: in test_search_combined_filters
+      task1 = await seed_task(title="Deploy v1")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  tests/conftest.py:51: in _seed
+      project = await seed_project()
+                ^^^^^^^^^^^^^^^^^^^^
+  tests/conftest.py:38: in _seed
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  =========================== short test summary info ============================
+  FAILED tests/test_search.py::test_search_by_status - assert 404 == 201
+  FAILED tests/test_search.py::test_search_by_title_substring - assert 404 == 201
+  FAILED tests/test_search.py::test_search_combined_filters - assert 404 == 201
+  ============================== 3 failed in 0.02s ===============================
+
+--- stats (ticket 06) ---
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  _____________________ test_stats_unassigned_tasks_excluded _____________________
+  tests/test_stats.py:55: in test_stats_unassigned_tasks_excluded
+      project = await seed_project()
+                ^^^^^^^^^^^^^^^^^^^^
+  tests/conftest.py:38: in _seed
+      user = await seed_user()
+             ^^^^^^^^^^^^^^^^^
+  tests/conftest.py:29: in _seed
+      assert resp.status_code == 201
+  E   assert 404 == 201
+  E    +  where 404 = <Response [404 Not Found]>.status_code
+  =========================== short test summary info ============================
+  FAILED tests/test_stats.py::test_stats_empty - assert 404 == 200
+  FAILED tests/test_stats.py::test_stats_with_data - assert 404 == 201
+  FAILED tests/test_stats.py::test_stats_unassigned_tasks_excluded - assert 404...
+  ============================== 3 failed in 0.02s ===============================

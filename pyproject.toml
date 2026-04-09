@@ -34,6 +34,8 @@ dependencies = [
     "mcp>=1.26",
     "libtmux>=0.37",
     "textual>=3.0",
+    "httpx>=0.24",
+    "pywebview>=5.0",
 ]
 
 [project.scripts]
