@@ -15,3 +15,4 @@ htmlcov/
 Thumbs.db
 ts_parser/node_modules/
 .lattice/
+.env

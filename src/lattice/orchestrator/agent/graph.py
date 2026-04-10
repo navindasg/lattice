@@ -1,147 +1,108 @@
-"""LangGraph StateGraph definition for the orchestrator agent.
+"""LangGraph agent graph for the orchestrator — built via Deep Agent harness.
 
-Builds a supervisor graph with:
-    - supervisor node: LLM reasoning with tool binding
-    - tool node: executes tool calls from the supervisor
-    - conditional routing: loops back to supervisor after tools, ends on no tool calls
+Uses `create_deep_agent` from the `deepagents` library to produce a compiled
+LangGraph graph with built-in planning (`write_todos`), filesystem tools,
+sub-agent delegation (`task`), and automatic context summarization.
 
-The graph supports checkpointing via DuckDBCheckpointer for crash recovery.
+Custom orchestrator tools (cc_spawn, cc_send, cc_approve, etc.) are passed
+as additional tools.  Soul files (SOUL.md, AGENTS.md) are loaded via the
+``memory`` parameter so they are always present in the system prompt.
+
+The returned graph is a standard LangGraph ``CompiledGraph`` — it supports
+checkpointers, streaming, and all LangGraph features.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any
 
 import structlog
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
-from langgraph.graph import END, StateGraph
-from langgraph.prebuilt import ToolNode
 
 from lattice.orchestrator.agent.prompt import build_system_prompt
-from lattice.orchestrator.agent.state import AgentState
-from lattice.orchestrator.agent.tools import ALL_TOOLS, ToolContext, set_tool_context
+from lattice.orchestrator.agent.tools import (
+    CUSTOM_TOOLS,
+    ToolContext,
+    set_tool_context,
+)
 from lattice.orchestrator.soul_ecosystem.reader import SoulReader
 
 logger = structlog.get_logger(__name__)
-
-
-def _should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-    """Determine whether to route to tools or end.
-
-    If the last message is an AIMessage with tool_calls, route to tools.
-    Otherwise, end the graph execution.
-
-    Args:
-        state: Current agent state.
-
-    Returns:
-        "tools" if there are pending tool calls, "__end__" otherwise.
-    """
-    messages = state.get("messages", [])
-    if not messages:
-        return "__end__"
-
-    last_message = messages[-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tools"
-
-    return "__end__"
-
-
-def _create_supervisor_node(
-    model: BaseChatModel,
-    system_prompt: str,
-):
-    """Create the supervisor node function.
-
-    The supervisor node prepends the system prompt to messages,
-    invokes the LLM with tool binding, and returns the response.
-
-    Args:
-        model: The chat model to use for reasoning.
-        system_prompt: The assembled system prompt.
-
-    Returns:
-        A function compatible with LangGraph node API.
-    """
-    tools = ALL_TOOLS
-    model_with_tools = model.bind_tools(tools)
-
-    def supervisor(state: AgentState) -> dict[str, Any]:
-        """Supervisor node: reason about state and decide next action."""
-        messages = list(state.get("messages", []))
-
-        # Prepend system prompt if not already present
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=system_prompt)] + messages
-
-        response = model_with_tools.invoke(messages)
-
-        logger.info(
-            "orchestrator_agent.supervisor",
-            tool_calls=len(response.tool_calls) if hasattr(response, "tool_calls") else 0,
-        )
-
-        return {"messages": [response]}
-
-    return supervisor
 
 
 def build_orchestrator_graph(
     model: BaseChatModel,
     tool_context: ToolContext,
     soul_reader: SoulReader | None = None,
-) -> StateGraph:
-    """Build the orchestrator LangGraph StateGraph.
+    checkpointer: Any | None = None,
+) -> Any:
+    """Build the orchestrator agent via the Deep Agent harness.
 
-    Creates a supervisor agent with tool binding, conditional routing,
-    and checkpointing support.
+    Creates a ``create_deep_agent`` graph with:
+    - Custom orchestrator tools (cc_spawn, cc_send, etc.)
+    - Soul files loaded as persistent memory
+    - Filesystem backend rooted at the soul directory
+    - DuckDB checkpointer for crash recovery
 
     Args:
-        model: The chat model for the supervisor node.
+        model: The chat model for reasoning (e.g. ChatAnthropic).
         tool_context: ToolContext with dependencies for all tools.
         soul_reader: SoulReader for system prompt assembly.
             If None, uses the one from tool_context.
+        checkpointer: LangGraph-compatible checkpoint saver.
+            If None, the graph runs without persistence.
 
     Returns:
-        Uncompiled StateGraph. Call graph.compile(checkpointer=...) before
-        invoking to enable checkpointing, or graph.compile() for in-memory use.
+        Compiled LangGraph graph (from create_deep_agent).
     """
+    from deepagents import create_deep_agent
+    from deepagents.backends import FilesystemBackend
+
     # Set module-level tool context for tools to access
     set_tool_context(tool_context)
 
-    # Build system prompt
+    # Build the core directive (does NOT include soul file content —
+    # soul files are loaded via the memory= parameter below)
     reader = soul_reader or tool_context.soul_reader
-    system_prompt = build_system_prompt(reader)
+    # Extract project root from the soul directory path (two levels up from .lattice/soul/)
+    project_root = str(reader.soul_dir.parent.parent) if reader.soul_dir else ""
+    system_prompt = build_system_prompt(reader, project_root=project_root)
 
-    # Create nodes
-    supervisor = _create_supervisor_node(model, system_prompt)
-    tool_node = ToolNode(ALL_TOOLS)
+    # Resolve soul directory for memory files and filesystem backend
+    soul_dir = reader.soul_dir
 
-    # Build graph
-    graph = StateGraph(AgentState)
-    graph.add_node("supervisor", supervisor)
-    graph.add_node("tools", tool_node)
+    # Memory files: always loaded into the system prompt by the harness.
+    # SOUL.md = identity/mission, AGENTS.md = approval procedures.
+    # STATE.md and MEMORY.md are NOT included — they're accessed via
+    # soul_read/soul_update tools to keep the prompt lean.
+    memory_files: list[str] = []
+    for fname in ("SOUL.md", "AGENTS.md"):
+        fpath = soul_dir / fname
+        if fpath.exists():
+            memory_files.append(str(fpath))
 
-    # Set entry point
-    graph.set_entry_point("supervisor")
+    # Filesystem backend: lets the harness's built-in file tools
+    # (read_file, write_file, ls, grep) operate within the soul directory.
+    # The orchestrator can read/write STATE.md directly via these tools
+    # as a fallback, but should prefer soul_read/soul_update for atomicity.
+    backend = FilesystemBackend(root_dir=str(soul_dir.parent), virtual_mode=True)
 
-    # Conditional routing: supervisor -> tools (if tool_calls) or END
-    graph.add_conditional_edges(
-        "supervisor",
-        _should_continue,
-        {
-            "tools": "tools",
-            "__end__": END,
-        },
+    # Build the deep agent graph
+    agent = create_deep_agent(
+        model=model,
+        tools=list(CUSTOM_TOOLS),
+        system_prompt=system_prompt,
+        memory=memory_files if memory_files else None,
+        backend=backend,
+        checkpointer=checkpointer,
+        name="lattice-orchestrator",
     )
-
-    # After tools, always return to supervisor for next reasoning step
-    graph.add_edge("tools", "supervisor")
 
     logger.info(
-        "orchestrator_agent.graph_built",
-        tool_count=len(ALL_TOOLS),
+        "orchestrator_agent.deep_agent_built",
+        custom_tool_count=len(CUSTOM_TOOLS),
+        memory_files=len(memory_files),
+        soul_dir=str(soul_dir),
     )
 
-    return graph
+    return agent

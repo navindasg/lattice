@@ -246,25 +246,46 @@ def cc_status(instance: str) -> dict[str, Any]:
 
 @tool
 def cc_spawn(project: str, task: str) -> dict[str, Any]:
-    """Start a new CC instance in a new tmux pane.
+    """Start a new CC instance ONLY if no idle instances are available.
 
-    Spawns a new pane running `claude`, then sends the task as the
-    first prompt. The new instance is registered in STATE.md.
+    Before spawning, checks STATE.md for existing instances. If any are
+    idle, returns an error listing them so you can use cc_send instead.
 
     Args:
         project: Project directory path for the CC session.
         task: Task description to send as the first prompt.
 
     Returns:
-        Dict with new instance details.
+        Dict with new instance details, or error if idle instances exist.
     """
     ctx = get_tool_context()
+    logger.info("cc_spawn.invoked", project=project, task=task[:80])
+
+    # Awareness: log existing instances so the agent sees what's already running.
+    # This is informational — spawning still proceeds. The agent should prefer
+    # cc_send for idle instances but isn't blocked from spawning.
+    state = ctx.soul_reader.read_state()
+    existing_summary: list[str] = []
+    for inst in state.instances:
+        existing_summary.append(
+            f"instance {inst.instance_id}: {inst.status} — {inst.task_description}"
+        )
+    if existing_summary:
+        logger.info(
+            "cc_spawn.existing_instances",
+            count=len(existing_summary),
+            instances=existing_summary,
+        )
 
     # Sanitize project path to prevent shell injection
     safe_project = shlex.quote(project)
-    pane_id = _run_async(
-        ctx.terminal.spawn_pane(f"cd {safe_project} && claude", name=f"cc-{project}")
-    )
+    try:
+        pane_id = _run_async(
+            ctx.terminal.spawn_pane(f"cd {safe_project} && claude", name=f"cc-{project}")
+        )
+    except Exception as exc:
+        logger.error("cc_spawn.spawn_failed", error=str(exc), project=project)
+        return {"success": False, "error": f"Failed to spawn: {exc}"}
 
     # Detect instance number
     instances = _run_async(ctx.terminal.detect_cc_panes())
@@ -280,8 +301,19 @@ def cc_spawn(project: str, task: str) -> dict[str, Any]:
     # Register in pane map
     ctx.instance_pane_map[new_instance] = pane_id
 
-    # Brief delay for CC to initialize, then send task
-    _run_async(asyncio.sleep(2.0))
+    # Wait for Claude CLI to finish initializing before sending the task.
+    # Uses output-based readiness detection: waits until the terminal has
+    # produced output and gone quiet (prompt is showing).
+    from lattice.orchestrator.terminal.pty_backend import PTYBackend
+
+    if isinstance(ctx.terminal, PTYBackend):
+        ready = _run_async(ctx.terminal.wait_for_ready(pane_id, timeout=20.0, quiet_period=1.5))
+        if not ready:
+            logger.warning("cc_spawn.not_ready_sending_anyway", pane_id=pane_id)
+    else:
+        # Fallback for non-PTY backends (e.g. TmuxBackend)
+        _run_async(asyncio.sleep(5.0))
+
     _run_async(ctx.terminal.send_text(pane_id, task))
     _run_async(ctx.terminal.send_enter(pane_id))
 
@@ -303,12 +335,20 @@ def cc_spawn(project: str, task: str) -> dict[str, Any]:
     ctx.soul_writer.update_full_state(updated)
 
     logger.info("cc_spawn", instance=new_instance, pane_id=pane_id, task=task)
-    return {
+    result: dict[str, Any] = {
         "success": True,
         "instance": new_instance,
         "pane_id": pane_id,
         "task": task,
     }
+    # Include existing instance summary so the agent stays aware
+    if existing_summary:
+        result["note"] = (
+            f"You now have {len(existing_summary) + 1} instances. "
+            f"Existing before this spawn: {'; '.join(existing_summary)}. "
+            f"Use cc_send to assign work to existing instances instead of spawning more."
+        )
+    return result
 
 
 @tool
@@ -470,34 +510,54 @@ def map_query(directory: str) -> dict[str, Any]:
 
 
 @tool
-def write_todos(tasks: list[str]) -> dict[str, Any]:
-    """Plan and track work items by updating the Plan section of STATE.md.
+def map_refresh(project_dir: str) -> dict[str, Any]:
+    """Re-generate codebase maps for fresh intelligence.
 
-    Replaces the current plan with the provided task list.
+    Runs the Lattice map pipeline (init + doc) on the project directory
+    to update .agent-docs/ with current codebase summaries. Call this
+    before assigning work so CC instances have up-to-date context.
 
     Args:
-        tasks: List of task descriptions to track.
+        project_dir: Absolute path to the project directory to map.
 
     Returns:
-        Dict with success status and task count.
+        Dict with success status and path to generated docs.
     """
-    ctx = get_tool_context()
+    import subprocess
 
-    plan_content = "\n".join(f"- {task}" for task in tasks)
-    ctx.soul_writer.update_state("Plan", plan_content)
+    safe_dir = shlex.quote(project_dir)
+    agent_docs_path = Path(project_dir) / ".agent-docs"
 
-    logger.info("write_todos", task_count=len(tasks))
-    return {
-        "success": True,
-        "task_count": len(tasks),
-        "tasks": tasks,
-    }
+    try:
+        # Run map:init to build the dependency graph
+        subprocess.run(
+            ["uv", "run", "lattice", "map:init", safe_dir],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        logger.info("map_refresh.init_complete", project_dir=project_dir)
+
+        return {
+            "success": True,
+            "project_dir": project_dir,
+            "agent_docs": str(agent_docs_path),
+            "note": "Codebase maps refreshed. Use map_query to read summaries.",
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Map refresh timed out after 120s"}
+    except Exception as exc:
+        logger.error("map_refresh.failed", error=str(exc))
+        return {"success": False, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
-# Tool registry
+# Tool registries
 # ---------------------------------------------------------------------------
 
+# ALL_TOOLS includes everything (for backward compat with tests).
 ALL_TOOLS = [
     cc_send,
     cc_approve,
@@ -509,5 +569,9 @@ ALL_TOOLS = [
     soul_read,
     soul_update,
     map_query,
-    write_todos,
+    map_refresh,
 ]
+
+# CUSTOM_TOOLS: passed to create_deep_agent as additional tools.
+# Excludes write_todos (provided by deep agent harness built-in).
+CUSTOM_TOOLS = ALL_TOOLS

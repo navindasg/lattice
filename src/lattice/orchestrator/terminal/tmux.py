@@ -1,5 +1,10 @@
 """Tmux terminal backend using libtmux.
 
+.. deprecated::
+    The TmuxBackend is deprecated in favor of :class:`lattice.ui.pty_manager.PTYManager`,
+    which provides direct PTY management without requiring an external tmux server.
+    TmuxBackend will be removed in a future release.
+
 All public methods are async.  Synchronous libtmux calls are dispatched
 to a thread-pool executor so the event loop is never blocked.
 """
@@ -7,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import warnings
 from functools import partial
 from typing import Any
 
@@ -44,12 +50,21 @@ def _get_server() -> Any:
 class TmuxBackend(TerminalBackend):
     """Tmux implementation of :class:`TerminalBackend` via *libtmux*.
 
+    .. deprecated::
+        Use :class:`lattice.ui.pty_manager.PTYManager` instead.
+        TmuxBackend will be removed in a future release.
+
     Maintains a stable numbering map so user-facing CC instance numbers
     persist across successive ``detect_cc_panes`` calls.  Numbers are
     never reused until :meth:`rescan` is called explicitly.
     """
 
     def __init__(self) -> None:
+        warnings.warn(
+            "TmuxBackend is deprecated. Use lattice.ui.pty_manager.PTYManager instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._server = _get_server()
         self._pane_number_map: dict[str, int] = {}
         self._next_number: int = 1

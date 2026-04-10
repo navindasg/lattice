@@ -1,23 +1,25 @@
-"""Tests for orchestrator agent graph construction and routing."""
+"""Tests for orchestrator agent graph construction via Deep Agent harness."""
 from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from lattice.orchestrator.agent.graph import (
-    _should_continue,
-    build_orchestrator_graph,
-)
-from lattice.orchestrator.agent.tools import ALL_TOOLS, ToolContext, set_tool_context
+from lattice.orchestrator.agent.graph import build_orchestrator_graph
+from lattice.orchestrator.agent.tools import ALL_TOOLS, CUSTOM_TOOLS, ToolContext, set_tool_context
 from lattice.orchestrator.soul_ecosystem.models import SoulContext
 
 
 @pytest.fixture
-def mock_soul_reader() -> MagicMock:
+def mock_soul_reader(tmp_path: Path) -> MagicMock:
     reader = MagicMock()
+    reader.soul_dir = tmp_path / "soul"
+    reader.soul_dir.mkdir(parents=True, exist_ok=True)
+    # Create SOUL.md and AGENTS.md for memory loading
+    (reader.soul_dir / "SOUL.md").write_text("# Identity\nTest orchestrator")
+    (reader.soul_dir / "AGENTS.md").write_text("# Procedures\nTest rules")
     reader.read_all.return_value = SoulContext(
         soul="# Identity",
         agents="# Procedures",
@@ -25,6 +27,7 @@ def mock_soul_reader() -> MagicMock:
         memory="# Memory",
     )
     reader.build_system_prompt.return_value = "=== IDENTITY ===\ntest"
+    reader._read_file.return_value = "## Instances\n_No active instances_"
     return reader
 
 
@@ -41,71 +44,43 @@ def tool_ctx(mock_soul_reader: MagicMock) -> ToolContext:
     return ctx
 
 
-class TestShouldContinue:
-    def test_empty_messages_returns_end(self) -> None:
-        state = {"messages": [], "instances": {}, "pending_approvals": {}, "plan": [], "last_event": None}
-        assert _should_continue(state) == "__end__"
-
-    def test_ai_message_with_tool_calls_returns_tools(self) -> None:
-        ai_msg = AIMessage(content="", tool_calls=[{"name": "cc_send", "args": {}, "id": "1"}])
-        state = {"messages": [ai_msg], "instances": {}, "pending_approvals": {}, "plan": [], "last_event": None}
-        assert _should_continue(state) == "tools"
-
-    def test_ai_message_without_tool_calls_returns_end(self) -> None:
-        ai_msg = AIMessage(content="All done.")
-        state = {"messages": [ai_msg], "instances": {}, "pending_approvals": {}, "plan": [], "last_event": None}
-        assert _should_continue(state) == "__end__"
-
-    def test_human_message_returns_end(self) -> None:
-        human_msg = HumanMessage(content="hello")
-        state = {"messages": [human_msg], "instances": {}, "pending_approvals": {}, "plan": [], "last_event": None}
-        assert _should_continue(state) == "__end__"
-
-
 class TestBuildOrchestratorGraph:
     def test_graph_builds_successfully(
         self, tool_ctx: ToolContext, mock_soul_reader: MagicMock
     ) -> None:
-        """build_orchestrator_graph returns a valid StateGraph."""
-        mock_model = MagicMock()
-        mock_model.bind_tools.return_value = mock_model
+        """build_orchestrator_graph returns a compiled graph."""
+        from langchain_core.language_models import FakeListChatModel
+
+        fake_model = FakeListChatModel(responses=["test"])
 
         graph = build_orchestrator_graph(
-            model=mock_model,
+            model=fake_model,
             tool_context=tool_ctx,
             soul_reader=mock_soul_reader,
         )
 
         assert graph is not None
 
-    def test_graph_has_supervisor_and_tools_nodes(
-        self, tool_ctx: ToolContext, mock_soul_reader: MagicMock
-    ) -> None:
-        """Graph contains supervisor and tools nodes."""
-        mock_model = MagicMock()
-        mock_model.bind_tools.return_value = mock_model
+    def test_custom_tools_excludes_write_todos(self) -> None:
+        """CUSTOM_TOOLS does not include write_todos (built-in to deep agent)."""
+        names = {t.name for t in CUSTOM_TOOLS}
+        assert "write_todos" not in names
 
-        graph = build_orchestrator_graph(
-            model=mock_model,
-            tool_context=tool_ctx,
-            soul_reader=mock_soul_reader,
-        )
+    def test_custom_tools_includes_map_refresh(self) -> None:
+        """CUSTOM_TOOLS includes map_refresh."""
+        names = {t.name for t in CUSTOM_TOOLS}
+        assert "map_refresh" in names
 
-        # Check that nodes exist by inspecting the graph's nodes dict
-        assert "supervisor" in graph.nodes
-        assert "tools" in graph.nodes
+    def test_all_tools_has_expected_count(self) -> None:
+        """ALL_TOOLS has 11 entries."""
+        assert len(ALL_TOOLS) == 11
 
-    def test_model_bound_with_all_tools(
-        self, tool_ctx: ToolContext, mock_soul_reader: MagicMock
-    ) -> None:
-        """The model is bound with all 11 tools."""
-        mock_model = MagicMock()
-        mock_model.bind_tools.return_value = mock_model
-
-        build_orchestrator_graph(
-            model=mock_model,
-            tool_context=tool_ctx,
-            soul_reader=mock_soul_reader,
-        )
-
-        mock_model.bind_tools.assert_called_once_with(ALL_TOOLS)
+    def test_expected_custom_tool_names(self) -> None:
+        """All expected custom tools are present."""
+        names = {t.name for t in CUSTOM_TOOLS}
+        expected = {
+            "cc_send", "cc_approve", "cc_deny", "cc_status",
+            "cc_spawn", "cc_interrupt", "github_read",
+            "soul_read", "soul_update", "map_query", "map_refresh",
+        }
+        assert names == expected

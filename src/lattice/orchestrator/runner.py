@@ -86,10 +86,18 @@ class OrchestratorRunner:
         voice_enabled: bool = True,
         terminal_backend: Any | None = None,
         llm_model: Any | None = None,
+        initial_task: str | None = None,
+        tickets_dir: str | None = None,
+        dashboard: bool = False,
+        dashboard_columns: int = 3,
     ) -> None:
         self._project_root = project_root
         self._db_path = db_path
         self._soul_dir_path = Path(project_root) / soul_dir
+        self._initial_task = initial_task
+        self._tickets_dir = tickets_dir
+        self._dashboard = dashboard
+        self._dashboard_columns = dashboard_columns
         self._sock_path = sock_path or _DEFAULT_SOCK_PATH
         self._orch_config = orchestrator_config or OrchestratorConfig()
         self._voice_config = voice_config or VoiceConfig()
@@ -106,6 +114,8 @@ class OrchestratorRunner:
         self._soul_writer: SoulWriter | None = None
         self._db_conn: duckdb.DuckDBPyConnection | None = None
         self._shutdown_event: asyncio.Event | None = None
+        self._event_queue: asyncio.Queue | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
         self._event_server_restarts = 0
         self._instance_pane_map: dict[str, str] = {}
 
@@ -134,6 +144,45 @@ class OrchestratorRunner:
         """Map of CC instance number → tmux pane_id."""
         return self._instance_pane_map
 
+    def inject_text_command(self, text: str) -> bool:
+        """Inject a text command into the agent's event queue.
+
+        Thread-safe — can be called from the dashboard thread. Creates a
+        synthetic TaskAssignment event and schedules it on the orchestrator's
+        event loop.
+
+        Args:
+            text: The command text (from voice transcription or text input).
+
+        Returns:
+            True if the event was injected, False if the queue isn't ready.
+        """
+        if self._event_queue is None or self._event_loop is None:
+            log.warning("inject_text_command.not_ready")
+            return False
+
+        from datetime import datetime, timezone
+        from lattice.orchestrator.events.models import CCEvent
+
+        synthetic = CCEvent(
+            session_id="voice-command",
+            event_type="TaskAssignment",
+            tool_name=None,
+            tool_input=None,
+            tool_response=text,
+            transcript_path=None,
+            cwd=self._project_root,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        asyncio.run_coroutine_threadsafe(
+            self._event_queue.put(synthetic),
+            self._event_loop,
+        )
+
+        log.info("inject_text_command.injected", text=text[:100])
+        return True
+
     async def run(self) -> None:
         """Start the full orchestrator lifecycle.
 
@@ -142,9 +191,14 @@ class OrchestratorRunner:
         """
         self._shutdown_event = asyncio.Event()
 
+        # Signal handlers only work on the main thread. When running in a
+        # background thread (e.g. with --with-dashboard), skip registration
+        # and rely on the dashboard's on_closed callback to set shutdown_event.
+        import threading
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, self._handle_signal, sig)
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, self._handle_signal, sig)
 
         # Step 1: Check for existing orchestrator (socket lock)
         if self._sock_path.exists():
@@ -175,6 +229,8 @@ class OrchestratorRunner:
                 sock_path=self._sock_path,
             )
             event_queue = await self._event_server.start()
+            self._event_queue = event_queue
+            self._event_loop = asyncio.get_running_loop()
 
             # Step 5: Check hooks (warn if not installed)
             hook_installer = HookInstaller(sock_path=self._sock_path)
@@ -213,6 +269,7 @@ class OrchestratorRunner:
                 soul_writer=self._soul_writer,
                 approval_submit=tool_context.approval_submit,
                 shutdown_event=self._shutdown_event,
+                project_root=self._project_root,
             )
 
             # Step 9: Setup process manager and mapper
@@ -261,6 +318,30 @@ class OrchestratorRunner:
             )
             if self._voice_enabled:
                 log.info("voice_listener_ready")
+
+            # Spawn CC instances directly from tickets directory
+            if self._tickets_dir:
+                await self._spawn_from_tickets(self._tickets_dir)
+            elif self._initial_task:
+                # Fallback: inject as synthetic event for the agent to handle
+                from datetime import datetime, timezone
+                from lattice.orchestrator.events.models import CCEvent
+
+                synthetic = CCEvent(
+                    session_id="initial-task",
+                    event_type="TaskAssignment",
+                    tool_name=None,
+                    tool_input=None,
+                    tool_response=self._initial_task,
+                    transcript_path=None,
+                    cwd=self._project_root,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                await event_queue.put(synthetic)
+                log.info(
+                    "initial_task_injected",
+                    task=self._initial_task[:100],
+                )
 
             # Wait for shutdown signal or task failure
             done, pending = await asyncio.wait(
@@ -334,6 +415,15 @@ class OrchestratorRunner:
                         error=str(exc),
                     )
 
+        # Shut down PTY backend if applicable
+        try:
+            from lattice.orchestrator.terminal.pty_backend import PTYBackend
+            if isinstance(self._terminal_backend, PTYBackend):
+                self._terminal_backend.shutdown()
+                log.info("pty_backend_shutdown")
+        except Exception as exc:
+            log.warning("shutdown_pty_error", error=str(exc))
+
         # Ensure socket file is removed even if event server didn't clean up
         if self._sock_path.exists():
             self._sock_path.unlink(missing_ok=True)
@@ -344,6 +434,127 @@ class OrchestratorRunner:
             self._db_conn.close()
             self._db_conn = None
 
+    def run_with_dashboard(self) -> None:
+        """Start orchestrator + native dashboard sharing the same PTYManager.
+
+        pywebview requires the main thread on macOS, so the async orchestrator
+        loop runs in a background thread while the dashboard takes the main
+        thread.  The dashboard's PTYManager is the same instance used by
+        PTYBackend, so spawned CC terminals appear in the xterm.js grid.
+        """
+        import threading
+
+        import webview
+
+        from lattice.orchestrator.terminal.pty_backend import PTYBackend
+        from lattice.ui.pty_manager import PTYManager
+        from lattice.ui.services import DashboardService
+        from lattice.ui.webview_app import DashboardAPI, _Poller, _WEB_DIR
+
+        # Create shared PTYManager and wire it as the terminal backend
+        pty_mgr = PTYManager()
+        backend = PTYBackend(pty_mgr)
+        self._terminal_backend = backend
+
+        # Create the async event loop for the orchestrator
+        loop = asyncio.new_event_loop()
+
+        # Create DashboardAPI with the shared PTYManager.
+        # Pass the PTYBackend as terminal_backend so DashboardService
+        # skips tmux initialization (no redundant tmux polling).
+        service = DashboardService(
+            soul_dir=self._soul_dir_path,
+            sock_path=self._sock_path,
+            terminal_backend=backend,
+        )
+        api = DashboardAPI(
+            service=service,
+            columns=self._dashboard_columns,
+            interactive=True,
+        )
+        api._loop = loop
+        # Wire the shared PTYManager into the dashboard (don't create a new one)
+        api._pty_manager = pty_mgr
+        # Wire text/voice commands to the agent's event queue
+        api._runner = self
+
+        # Run orchestrator in background thread
+        def _run_orchestrator() -> None:
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(service.initialize())
+            except Exception as exc:
+                log.error("dashboard.service_init_failed", error=str(exc))
+            try:
+                loop.run_until_complete(self.run())
+            except (SystemExit, KeyboardInterrupt):
+                pass
+            finally:
+                loop.call_soon_threadsafe(loop.stop)
+
+        orch_thread = threading.Thread(
+            target=_run_orchestrator,
+            daemon=True,
+            name="lattice-orchestrator",
+        )
+        orch_thread.start()
+
+        # Launch pywebview on main thread
+        index_path = _WEB_DIR / "index.html"
+        window = webview.create_window(
+            title="Lattice Dashboard",
+            url=str(index_path),
+            js_api=api,
+            width=1400,
+            height=900,
+            min_size=(900, 600),
+            background_color="#0f1117",
+            text_select=True,
+        )
+        api._window = window
+
+        # Wire PTYManager output/exit callbacks to push to dashboard
+        def _on_output(pane_id: str, data: bytes) -> None:
+            api._on_terminal_output(pane_id, data)
+
+        def _on_exit(pane_id: str, exit_code: int | None) -> None:
+            api._on_terminal_exit(pane_id, exit_code)
+
+        pty_mgr._on_output = _on_output
+        pty_mgr._on_exit = _on_exit
+
+        poller: _Poller | None = None
+
+        def _on_loaded() -> None:
+            nonlocal poller
+            import json
+            try:
+                config_json = json.dumps(api.config)
+                safe_str = json.dumps(config_json)
+                window.evaluate_js(
+                    f"window.__latticeInit && window.__latticeInit(JSON.parse({safe_str}));"
+                )
+            except Exception as exc:
+                log.error("webview.init_failed", error=str(exc))
+
+            if poller is not None:
+                poller.stop()
+            poller = _Poller(service=service, window=window, loop=loop)
+            poller.start()
+
+        def _on_closed() -> None:
+            if poller is not None:
+                poller.stop()
+            # Signal orchestrator shutdown
+            if self._shutdown_event is not None:
+                self._shutdown_event.set()
+
+        window.events.loaded += _on_loaded
+        window.events.closed += _on_closed
+
+        log.info("dashboard.launching", columns=self._dashboard_columns)
+        webview.start(debug=False)
+
     def _handle_signal(self, sig: signal.Signals) -> None:
         """Signal handler that triggers graceful shutdown."""
         log.info("orchestrator_signal_received", signal=sig.name)
@@ -353,35 +564,45 @@ class OrchestratorRunner:
     async def _detect_cc_instances(self) -> list[Any]:
         """Detect CC instances via terminal backend.
 
-        If no terminal backend is available (no tmux), logs a warning and
-        returns an empty list. Updates the instance_pane_map.
+        Uses PTYBackend by default (direct PTY management). Falls back
+        to TmuxBackend if PTYBackend is not available.
 
         Returns:
             List of CCInstance objects detected.
         """
         if self._terminal_backend is None:
             try:
-                from lattice.orchestrator.terminal.tmux import TmuxBackend
-                self._terminal_backend = TmuxBackend()
-            except RuntimeError as exc:
-                error_msg = str(exc)
-                if "No tmux server" in error_msg:
-                    log.error("no_tmux_server")
-                    raise SystemExit(
-                        "No tmux server found. Start tmux and launch "
-                        "Claude Code instances first."
-                    ) from exc
-                raise
+                from lattice.orchestrator.terminal.pty_backend import PTYBackend
+                from lattice.ui.pty_manager import PTYManager
+
+                pty_mgr = PTYManager()
+                self._terminal_backend = PTYBackend(pty_mgr)
+                log.info("terminal_backend.pty_initialized")
+            except Exception as exc:
+                log.warning(
+                    "pty_backend_init_failed",
+                    error=str(exc),
+                    hint="Falling back to TmuxBackend",
+                )
+                try:
+                    from lattice.orchestrator.terminal.tmux import TmuxBackend
+                    self._terminal_backend = TmuxBackend()
+                except RuntimeError as tmux_exc:
+                    error_msg = str(tmux_exc)
+                    if "No tmux server" in error_msg:
+                        log.error("no_terminal_backend")
+                        raise SystemExit(
+                            "No terminal backend available. "
+                            "PTYBackend failed and no tmux server found."
+                        ) from tmux_exc
+                    raise
 
         instances = await self._terminal_backend.detect_cc_panes()
 
         if not instances:
-            log.warning(
+            log.info(
                 "no_cc_instances_detected",
-                hint=(
-                    "No Claude Code instances detected. Use cc_spawn to "
-                    "create one, or start CC in a tmux pane."
-                ),
+                hint="Use cc_spawn to create Claude Code instances.",
             )
 
         # Build instance → pane map for agent tools (immutable rebuild)
@@ -392,33 +613,48 @@ class OrchestratorRunner:
         return instances
 
     def _build_agent_graph(self, tool_context: ToolContext) -> Any:
-        """Build and compile the LangGraph orchestrator agent.
+        """Build the orchestrator agent via the Deep Agent harness.
 
         If no LLM model is provided, creates a default Anthropic model.
+        The deep agent harness returns a compiled graph directly — no
+        separate compile step needed.
 
         Args:
             tool_context: Populated ToolContext for agent tools.
 
         Returns:
-            Compiled LangGraph StateGraph.
+            Compiled LangGraph graph (from create_deep_agent).
         """
         model = self._llm_model
         if model is None:
             from langchain_anthropic import ChatAnthropic
+            from lattice.llm.config import LatticeSettings
+
+            settings = LatticeSettings()
+            api_key = settings.anthropic_api_key
+            if not api_key:
+                import os
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise SystemExit(
+                    "ANTHROPIC_API_KEY not set. Add it to .env or export it."
+                )
+
             model = ChatAnthropic(
                 model="claude-sonnet-4-6",
                 temperature=0.0,
                 max_tokens=8192,
+                api_key=api_key,
             )
 
-        graph = build_orchestrator_graph(
+        checkpointer = DuckDBCheckpointer(self._db_conn)
+
+        return build_orchestrator_graph(
             model=model,
             tool_context=tool_context,
             soul_reader=self._soul_reader,
+            checkpointer=checkpointer,
         )
-
-        checkpointer = DuckDBCheckpointer(self._db_conn)
-        return graph.compile(checkpointer=checkpointer)
 
     def _print_instance_table(self, instances: list[Any]) -> None:
         """Print a formatted table of detected CC instances.
@@ -438,6 +674,90 @@ class OrchestratorRunner:
                 cwd=inst.cwd,
                 command=inst.running_command,
             )
+
+    async def _spawn_from_tickets(self, tickets_dir: str) -> None:
+        """Spawn one idle CC instance per ticket file.
+
+        Creates Claude CLI processes in the project directory but does
+        NOT send any task — the user will assign work via voice/text
+        commands through the dashboard.
+
+        Args:
+            tickets_dir: Absolute path to the tickets/ directory.
+        """
+        from datetime import datetime, timezone
+        import shlex
+
+        from lattice.orchestrator.soul_ecosystem.models import (
+            InstanceAssignment,
+            OrchestratorState,
+        )
+
+        tickets_path = Path(tickets_dir)
+        if not tickets_path.is_dir():
+            log.error("spawn_from_tickets.dir_not_found", path=tickets_dir)
+            return
+
+        ticket_files = sorted(tickets_path.glob("*.md"))
+        if not ticket_files:
+            log.warning("spawn_from_tickets.no_tickets", path=tickets_dir)
+            return
+
+        log.info("spawn_from_tickets.start", count=len(ticket_files))
+
+        safe_project = shlex.quote(self._project_root)
+        assignments: list[InstanceAssignment] = []
+
+        for ticket_file in ticket_files:
+            ticket_name = ticket_file.name
+
+            # Spawn claude in the project directory (idle — no task sent)
+            pane_id = await self._terminal_backend.spawn_pane(
+                f"cd {safe_project} && claude",
+                name=f"cc-{ticket_name}",
+            )
+
+            # Assign stable instance number
+            instances = await self._terminal_backend.detect_cc_panes()
+            instance_num = None
+            for inst in instances:
+                if inst.pane_id == pane_id:
+                    instance_num = str(inst.user_number)
+                    break
+            if instance_num is None:
+                instance_num = str(len(self._instance_pane_map) + 1)
+
+            self._instance_pane_map[instance_num] = pane_id
+
+            assignments.append(InstanceAssignment(
+                instance_id=instance_num,
+                task_description=f"idle — ticket: {ticket_name}",
+                status="idle",
+                assigned_at=datetime.now(timezone.utc).isoformat(),
+            ))
+
+            log.info(
+                "spawn_from_tickets.spawned",
+                instance=instance_num,
+                pane_id=pane_id,
+                ticket=ticket_name,
+            )
+
+        # Update STATE.md with idle instances
+        if self._soul_reader and self._soul_writer:
+            state = self._soul_reader.read_state()
+            updated = OrchestratorState(
+                instances=[*state.instances, *assignments],
+                plan=list(state.plan),
+                decisions=list(state.decisions),
+                blockers=list(state.blockers),
+            )
+            self._soul_writer.update_full_state(updated)
+
+        log.info(
+            "spawn_from_tickets.complete",
+            instances_spawned=len(assignments),
+        )
 
     async def _monitor_health(self) -> None:
         """Periodically check subsystem health.

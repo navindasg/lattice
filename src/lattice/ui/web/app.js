@@ -2,7 +2,11 @@
  * Lattice Dashboard — Frontend Application
  *
  * Receives push updates from the Python backend via window.__latticeUpdate(),
- * renders all dashboard panels, and handles keyboard shortcuts.
+ * renders all dashboard panels, and manages xterm.js terminal instances.
+ *
+ * Terminal output is pushed from the backend via window.__terminalOutput()
+ * as base64-encoded data.  Keyboard input flows back via
+ * window.pywebview.api.write_terminal().
  *
  * All state is immutable — each update replaces the previous snapshot entirely.
  * DOM updates are targeted (only changed elements are rewritten) to avoid
@@ -32,124 +36,34 @@ let voiceLogEntries = [];
 const MAX_VOICE_LOG = 50;
 const MAX_EVENTS_DISPLAY = 30;
 
-/** @type {Map<string, string>} Cache of last rendered output HTML per pane */
-const _lastOutputHtml = new Map();
-
 /** @type {string} Cache of last rendered soul panel HTML */
 let _lastSoulHtml = "";
 
 /** @type {string} Cache of last rendered event log HTML */
 let _lastEventHtml = "";
 
-
-/* ── ANSI Parser ───────────────────────────────────────────── */
-
-const ANSI_REGEX = /\x1b\[([0-9;]*)m/g;
-const STRIP_NON_SGR = /\x1b\[[0-9;]*[A-HJKSTfhlr]|\x1b\][^\x07]*\x07|\x1b\[\?[0-9;]*[hl]/g;
-
-const SGR_CLASSES = {
-    0: null,        // reset
-    1: "ansi-bold",
-    2: "ansi-dim",
-    3: "ansi-italic",
-    4: "ansi-underline",
-    30: "ansi-black", 31: "ansi-red", 32: "ansi-green", 33: "ansi-yellow",
-    34: "ansi-blue", 35: "ansi-magenta", 36: "ansi-cyan", 37: "ansi-white",
-    40: "ansi-bg-black", 41: "ansi-bg-red", 42: "ansi-bg-green", 43: "ansi-bg-yellow",
-    44: "ansi-bg-blue", 45: "ansi-bg-magenta", 46: "ansi-bg-cyan", 47: "ansi-bg-white",
-    90: "ansi-bright-black", 91: "ansi-bright-red", 92: "ansi-bright-green", 93: "ansi-bright-yellow",
-    94: "ansi-bright-blue", 95: "ansi-bright-magenta", 96: "ansi-bright-cyan", 97: "ansi-bright-white",
-};
-
 /**
- * Convert a string with ANSI escape codes into safe HTML with CSS classes.
- * All text content is escaped to prevent XSS.
- *
- * @param {string} text - Raw text with ANSI escapes
- * @returns {string} HTML string with <span> wrappers for styled segments
+ * @typedef {Object} ManagedTerminal
+ * @property {Terminal} xterm - xterm.js Terminal instance
+ * @property {FitAddon} fitAddon - Fit addon instance
+ * @property {HTMLElement} container - DOM container element
+ * @property {string} paneId - Unique terminal identifier
+ * @property {boolean} dead - Whether the terminal process has exited
+ * @property {number|null} exitCode - Exit code if dead
+ * @property {number} userNumber - User-facing number (1-9)
  */
-function ansiToHtml(text) {
-    text = text.replace(STRIP_NON_SGR, "");
-    const parts = [];
-    let activeClasses = new Set();
-    let lastIndex = 0;
 
-    let match;
-    ANSI_REGEX.lastIndex = 0;
-    while ((match = ANSI_REGEX.exec(text)) !== null) {
-        // Flush text before this escape
-        if (match.index > lastIndex) {
-            const segment = text.slice(lastIndex, match.index);
-            parts.push(wrapWithClasses(escapeHtml(segment), activeClasses));
-        }
-        lastIndex = match.index + match[0].length;
+/** @type {Map<string, ManagedTerminal>} Active terminal instances */
+const terminals = new Map();
 
-        // Parse SGR parameters
-        const params = match[1] ? match[1].split(";").map(Number) : [0];
-        for (const code of params) {
-            if (code === 0) {
-                activeClasses = new Set();
-            } else if (code === 22) {
-                activeClasses.delete("ansi-bold");
-                activeClasses.delete("ansi-dim");
-            } else if (code === 23) {
-                activeClasses.delete("ansi-italic");
-            } else if (code === 24) {
-                activeClasses.delete("ansi-underline");
-            } else if (code >= 39 && code <= 39) {
-                // Default foreground — remove all fg classes
-                for (const cls of [...activeClasses]) {
-                    if (cls.startsWith("ansi-") && !cls.startsWith("ansi-bg-") &&
-                        !["ansi-bold", "ansi-dim", "ansi-italic", "ansi-underline"].includes(cls)) {
-                        activeClasses.delete(cls);
-                    }
-                }
-            } else if (code === 49) {
-                // Default background — remove all bg classes
-                for (const cls of [...activeClasses]) {
-                    if (cls.startsWith("ansi-bg-")) {
-                        activeClasses.delete(cls);
-                    }
-                }
-            } else {
-                const cls = SGR_CLASSES[code];
-                if (cls) {
-                    // Remove conflicting classes in same category
-                    if (cls.startsWith("ansi-bg-")) {
-                        for (const c of [...activeClasses]) {
-                            if (c.startsWith("ansi-bg-")) activeClasses.delete(c);
-                        }
-                    } else if (!["ansi-bold", "ansi-dim", "ansi-italic", "ansi-underline"].includes(cls)) {
-                        for (const c of [...activeClasses]) {
-                            if (c.startsWith("ansi-") && !c.startsWith("ansi-bg-") &&
-                                !["ansi-bold", "ansi-dim", "ansi-italic", "ansi-underline"].includes(c)) {
-                                activeClasses.delete(c);
-                            }
-                        }
-                    }
-                    activeClasses.add(cls);
-                }
-            }
-        }
-    }
+/** @type {number} Next user-facing terminal number */
+let nextTerminalNumber = 1;
 
-    // Flush remaining text
-    if (lastIndex < text.length) {
-        parts.push(wrapWithClasses(escapeHtml(text.slice(lastIndex)), activeClasses));
-    }
+/** @type {Map<number, string>} User number to pane_id mapping */
+const numberToPaneId = new Map();
 
-    return parts.join("");
-}
 
-/**
- * @param {string} html - Already-escaped HTML
- * @param {Set<string>} classes
- * @returns {string}
- */
-function wrapWithClasses(html, classes) {
-    if (classes.size === 0) return html;
-    return `<span class="${[...classes].join(" ")}">${html}</span>`;
-}
+/* ── ANSI Helper (kept for non-terminal text like soul panel) ─ */
 
 /**
  * Escape HTML special characters to prevent XSS.
@@ -163,6 +77,511 @@ function escapeHtml(str) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#x27;");
+}
+
+
+/* ── Binary Encoding Helpers ──────────────────────────────── */
+
+/**
+ * Encode a Uint8Array to a base64 string.
+ * Avoids the spread-operator stack overflow that btoa(String.fromCharCode(...arr))
+ * causes on large arrays (>65k elements).
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string} Base64-encoded string
+ */
+function bytesToBase64(bytes) {
+    let binary = "";
+    const len = bytes.length;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+/**
+ * Decode a base64 string to a Uint8Array.
+ *
+ * @param {string} b64
+ * @returns {Uint8Array}
+ */
+function base64ToBytes(b64) {
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+        bytes[i] = raw.charCodeAt(i);
+    }
+    return bytes;
+}
+
+
+/* ── Terminal Management (xterm.js) ───────────────────────── */
+
+/**
+ * Spawn a new terminal via the backend PTYManager and create an
+ * xterm.js instance to render it.
+ *
+ * @param {Object} [opts] - Options for the new terminal.
+ * @param {string[]} [opts.cmd] - Command to run (default: user shell).
+ * @param {string} [opts.cwd] - Working directory.
+ * @returns {Promise<string|null>} The pane_id, or null on failure.
+ */
+async function spawnTerminal(opts) {
+    if (!window.pywebview || !window.pywebview.api) return null;
+
+    const grid = document.getElementById("terminal-grid");
+    if (!grid) return null;
+
+    // Remove placeholder if present
+    const placeholder = grid.querySelector("#grid-placeholder");
+    if (placeholder) placeholder.remove();
+
+    // Create DOM structure for this pane
+    const userNumber = nextTerminalNumber;
+    const paneEl = document.createElement("div");
+    paneEl.className = "terminal-pane";
+
+    const header = document.createElement("div");
+    header.className = "pane-header";
+    header.innerHTML = `
+        <span class="pane-number">${userNumber}</span>
+        <span class="pane-label">Terminal #${userNumber}</span>
+        <span class="pane-status-indicator pane-status-alive"></span>
+        <span class="pane-cwd"></span>
+        <button class="pane-close-btn" title="Close terminal">&times;</button>
+    `;
+    paneEl.appendChild(header);
+
+    const termContainer = document.createElement("div");
+    termContainer.className = "xterm-container";
+    paneEl.appendChild(termContainer);
+
+    // Dead terminal overlay (hidden initially)
+    const deadOverlay = document.createElement("div");
+    deadOverlay.className = "dead-overlay hidden";
+    deadOverlay.innerHTML = `<span class="dead-text">[exited]</span>`;
+    paneEl.appendChild(deadOverlay);
+
+    grid.appendChild(paneEl);
+
+    // Create xterm.js instance
+    const xterm = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        fontFamily: '"SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace',
+        fontSize: 10,
+        lineHeight: 1.2,
+        scrollback: 5000,
+        theme: {
+            background: "#0f1117",
+            foreground: "#e4e6ed",
+            cursor: "#4f8ff7",
+            cursorAccent: "#0f1117",
+            selectionBackground: "rgba(79, 143, 247, 0.3)",
+            selectionForeground: "#e4e6ed",
+            black: "#3b4048",
+            red: "#e55353",
+            green: "#3ecf71",
+            yellow: "#f5a623",
+            blue: "#4f8ff7",
+            magenta: "#c084fc",
+            cyan: "#59c9e8",
+            white: "#e4e6ed",
+            brightBlack: "#5c6070",
+            brightRed: "#ff7070",
+            brightGreen: "#5eff8a",
+            brightYellow: "#ffc44c",
+            brightBlue: "#80b5ff",
+            brightMagenta: "#dda0ff",
+            brightCyan: "#7ee0f5",
+            brightWhite: "#ffffff",
+        },
+        allowProposedApi: true,
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+
+    // Load web links addon for clickable URLs
+    try {
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        xterm.loadAddon(webLinksAddon);
+    } catch {
+        // Web links addon is optional
+    }
+
+    xterm.open(termContainer);
+
+    // Fit to container after DOM is rendered
+    requestAnimationFrame(() => {
+        fitAddon.fit();
+    });
+
+    // Request backend to spawn the PTY process
+    const spawnParams = {};
+    if (opts && opts.cmd) spawnParams.cmd = opts.cmd;
+    if (opts && opts.cwd) spawnParams.cwd = opts.cwd;
+    spawnParams.cols = xterm.cols;
+    spawnParams.rows = xterm.rows;
+
+    let paneId;
+    try {
+        const resJson = await window.pywebview.api.spawn_terminal(JSON.stringify(spawnParams));
+        const res = typeof resJson === "string" ? JSON.parse(resJson) : resJson;
+        if (!res.success) {
+            xterm.writeln(`\r\n\x1b[31mFailed to spawn terminal: ${res.error}\x1b[0m`);
+            return null;
+        }
+        paneId = res.pane_id;
+    } catch (err) {
+        xterm.writeln(`\r\n\x1b[31mSpawn error: ${err.message || String(err)}\x1b[0m`);
+        return null;
+    }
+
+    paneEl.dataset.paneId = paneId;
+    paneEl.dataset.userNumber = String(userNumber);
+
+    // Store the managed terminal
+    const managed = {
+        xterm,
+        fitAddon,
+        container: paneEl,
+        paneId,
+        dead: false,
+        exitCode: null,
+        userNumber,
+    };
+    terminals.set(paneId, managed);
+    numberToPaneId.set(userNumber, paneId);
+    nextTerminalNumber++;
+
+    // Wire keyboard input: xterm → backend
+    // Use TextEncoder for safe UTF-8 → base64 encoding (btoa alone
+    // throws on characters above U+00FF such as emoji or CJK).
+    xterm.onData((data) => {
+        if (managed.dead) return;
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(data);
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    // Wire binary input for special keys
+    xterm.onBinary((data) => {
+        if (managed.dead) return;
+        const bytes = new Uint8Array(data.length);
+        for (let i = 0; i < data.length; i++) {
+            bytes[i] = data.charCodeAt(i);
+        }
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    // Wire resize: fit addon → backend
+    xterm.onResize(({ cols, rows }) => {
+        if (managed.dead) return;
+        window.pywebview.api.resize_terminal(paneId, cols, rows).catch(() => {});
+    });
+
+    // Click to focus
+    paneEl.addEventListener("click", (e) => {
+        // Don't focus if clicking close button
+        if (e.target.closest(".pane-close-btn")) return;
+        setFocusedPane(paneId);
+    });
+
+    // Close button
+    const closeBtn = paneEl.querySelector(".pane-close-btn");
+    if (closeBtn) {
+        closeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            killTerminal(paneId);
+        });
+    }
+
+    // Focus this new terminal
+    setFocusedPane(paneId);
+
+    // Update terminal count in status bar
+    updateTerminalCount();
+
+    return paneId;
+}
+
+/**
+ * Create an xterm.js pane for an externally-spawned terminal (e.g. via cc_spawn).
+ * Does NOT call spawn_terminal on the backend — the process already exists.
+ *
+ * @param {string} paneId - The backend pane_id to attach to.
+ * @returns {ManagedTerminal|null} The created managed terminal, or null on failure.
+ */
+function createTerminalPane(paneId) {
+    const grid = document.getElementById("terminal-grid");
+    if (!grid) return null;
+
+    // Remove placeholder if present
+    const placeholder = grid.querySelector("#grid-placeholder");
+    if (placeholder) placeholder.remove();
+
+    const userNumber = nextTerminalNumber;
+    const paneEl = document.createElement("div");
+    paneEl.className = "terminal-pane";
+    paneEl.dataset.paneId = paneId;
+    paneEl.dataset.userNumber = String(userNumber);
+
+    const header = document.createElement("div");
+    header.className = "pane-header";
+    header.innerHTML = `
+        <span class="pane-number">${userNumber}</span>
+        <span class="pane-label">CC #${userNumber}</span>
+        <span class="pane-status-indicator pane-status-alive"></span>
+        <span class="pane-cwd"></span>
+        <button class="pane-close-btn" title="Close terminal">&times;</button>
+    `;
+    paneEl.appendChild(header);
+
+    const termContainer = document.createElement("div");
+    termContainer.className = "xterm-container";
+    paneEl.appendChild(termContainer);
+
+    const deadOverlay = document.createElement("div");
+    deadOverlay.className = "dead-overlay hidden";
+    deadOverlay.innerHTML = `<span class="dead-text">[exited]</span>`;
+    paneEl.appendChild(deadOverlay);
+
+    grid.appendChild(paneEl);
+
+    const xterm = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        fontFamily: '"SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace',
+        fontSize: 10,
+        lineHeight: 1.2,
+        scrollback: 5000,
+        theme: {
+            background: "#0f1117",
+            foreground: "#e4e6ed",
+            cursor: "#4f8ff7",
+            cursorAccent: "#0f1117",
+            selectionBackground: "rgba(79, 143, 247, 0.3)",
+            selectionForeground: "#e4e6ed",
+            black: "#3b4048",
+            red: "#e55353",
+            green: "#3ecf71",
+            yellow: "#f5a623",
+            blue: "#4f8ff7",
+            magenta: "#c084fc",
+            cyan: "#59c9e8",
+            white: "#e4e6ed",
+            brightBlack: "#5c6070",
+            brightRed: "#ff7070",
+            brightGreen: "#5eff8a",
+            brightYellow: "#ffc44c",
+            brightBlue: "#80b5ff",
+            brightMagenta: "#dda0ff",
+            brightCyan: "#7ee0f5",
+            brightWhite: "#ffffff",
+        },
+        allowProposedApi: true,
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+
+    try {
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        xterm.loadAddon(webLinksAddon);
+    } catch {
+        // optional
+    }
+
+    xterm.open(termContainer);
+    requestAnimationFrame(() => fitAddon.fit());
+
+    const managed = {
+        xterm,
+        fitAddon,
+        container: paneEl,
+        paneId,
+        dead: false,
+        exitCode: null,
+        userNumber,
+    };
+    terminals.set(paneId, managed);
+    numberToPaneId.set(userNumber, paneId);
+    nextTerminalNumber++;
+
+    // Wire keyboard input → backend
+    xterm.onData((data) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(data);
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    xterm.onBinary((data) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        const bytes = new Uint8Array(data.length);
+        for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i);
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    xterm.onResize(({ cols, rows }) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        window.pywebview.api.resize_terminal(paneId, cols, rows).catch(() => {});
+    });
+
+    paneEl.addEventListener("click", (e) => {
+        if (e.target.closest(".pane-close-btn")) return;
+        setFocusedPane(paneId);
+    });
+
+    const closeBtn = paneEl.querySelector(".pane-close-btn");
+    if (closeBtn) {
+        closeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            killTerminal(paneId);
+        });
+    }
+
+    updateTerminalCount();
+    return managed;
+}
+
+/**
+ * Kill a terminal and remove it from the grid.
+ * @param {string} paneId
+ */
+async function killTerminal(paneId) {
+    const managed = terminals.get(paneId);
+    if (!managed) return;
+
+    // Tell backend to kill the PTY
+    if (!managed.dead && window.pywebview && window.pywebview.api) {
+        try {
+            await window.pywebview.api.kill_terminal(paneId);
+        } catch {
+            // May already be dead
+        }
+    }
+
+    // Clean up xterm instance
+    managed.xterm.dispose();
+
+    // Remove from DOM
+    managed.container.remove();
+
+    // Clean up maps
+    terminals.delete(paneId);
+    numberToPaneId.delete(managed.userNumber);
+
+    // Unfocus if this was the focused pane
+    if (focusedPaneId === paneId) {
+        focusedPaneId = null;
+        // Focus the next available terminal
+        const remaining = Array.from(terminals.values());
+        if (remaining.length > 0) {
+            setFocusedPane(remaining[0].paneId);
+        }
+    }
+
+    // Show placeholder if no terminals left
+    if (terminals.size === 0) {
+        showGridPlaceholder();
+    }
+
+    updateTerminalCount();
+}
+
+/**
+ * Show the empty grid placeholder.
+ */
+function showGridPlaceholder() {
+    const grid = document.getElementById("terminal-grid");
+    if (!grid) return;
+    if (grid.querySelector("#grid-placeholder")) return;
+
+    grid.innerHTML = `
+        <div id="grid-placeholder" class="placeholder">
+            <div class="placeholder-icon">&#x1F4BB;</div>
+            <div class="placeholder-text">No terminals running</div>
+            <div class="placeholder-hint">Press <kbd>N</kbd> or click <strong>+</strong> to open a terminal</div>
+        </div>`;
+}
+
+/**
+ * Receive terminal output from the Python backend.
+ * Called via evaluate_js from the PTYManager output callback.
+ *
+ * @param {string} paneId - Terminal identifier.
+ * @param {string} b64Data - Base64-encoded output bytes.
+ */
+window.__terminalOutput = function(paneId, b64Data) {
+    let managed = terminals.get(paneId);
+
+    // Auto-create xterm instance for terminals spawned by the orchestrator
+    // (e.g. via cc_spawn) that the frontend doesn't know about yet
+    if (!managed) {
+        managed = createTerminalPane(paneId);
+        if (!managed) return;
+    }
+
+    managed.xterm.write(base64ToBytes(b64Data));
+};
+
+/**
+ * Handle terminal process exit notification from the backend.
+ * Called via evaluate_js from the PTYManager exit callback.
+ *
+ * @param {string} paneId - Terminal identifier.
+ * @param {number|null} exitCode - Process exit code.
+ */
+window.__terminalExited = function(paneId, exitCode) {
+    const managed = terminals.get(paneId);
+    if (!managed) return;
+
+    managed.dead = true;
+    managed.exitCode = exitCode;
+
+    // Show exit message in terminal
+    const codeStr = exitCode !== null ? String(exitCode) : "unknown";
+    managed.xterm.writeln(`\r\n\x1b[2m[Process exited with code ${codeStr}]\x1b[0m`);
+
+    // Show dead overlay
+    const overlay = managed.container.querySelector(".dead-overlay");
+    if (overlay) {
+        overlay.classList.remove("hidden");
+        const text = overlay.querySelector(".dead-text");
+        if (text) {
+            text.textContent = `[exited: ${codeStr}]`;
+        }
+    }
+
+    // Update status indicator
+    const indicator = managed.container.querySelector(".pane-status-indicator");
+    if (indicator) {
+        indicator.className = "pane-status-indicator pane-status-dead";
+    }
+
+    updateTerminalCount();
+};
+
+/**
+ * Handle window resize — refit all terminal instances.
+ */
+function refitAllTerminals() {
+    for (const managed of terminals.values()) {
+        try {
+            managed.fitAddon.fit();
+        } catch {
+            // Terminal may be disposed
+        }
+    }
 }
 
 
@@ -195,10 +614,11 @@ window.__latticeUpdate = function(snapshot) {
 
 /**
  * Render all dashboard panels from a snapshot.
+ * Terminal grid is managed separately via xterm.js — only sidebar
+ * panels and status bar are rendered from snapshot data.
  * @param {object} snap
  */
 function renderAll(snap) {
-    renderTerminalGrid(snap.instances, snap.captured_output);
     renderSoulPanel(snap.soul_state, snap.memory_entries);
     renderEventLog(snap.recent_events);
     renderStatusBar(snap);
@@ -217,101 +637,22 @@ function applyGridColumns(cols) {
 }
 
 
-/* ── Terminal Grid ─────────────────────────────────────────── */
-
-/**
- * Render terminal panes into the grid.
- * @param {object[]} instances
- * @param {Object<string, string[]>} capturedOutput
- */
-function renderTerminalGrid(instances, capturedOutput) {
-    const grid = document.getElementById("terminal-grid");
-    if (!grid) return;
-
-    if (!instances || instances.length === 0) {
-        grid.innerHTML = `
-            <div id="grid-placeholder" class="placeholder">
-                <div class="placeholder-icon">&#x1F4BB;</div>
-                <div class="placeholder-text">No CC instances detected</div>
-                <div class="placeholder-hint">Start Claude Code in a tmux session to see terminals here</div>
-            </div>`;
-        return;
-    }
-
-    const existingPanes = new Map();
-    for (const el of grid.querySelectorAll(".terminal-pane")) {
-        existingPanes.set(el.dataset.paneId, el);
-    }
-
-    const currentPaneIds = new Set(instances.map(i => i.pane_id));
-
-    // Remove stale panes and their output caches
-    for (const [paneId, el] of existingPanes) {
-        if (!currentPaneIds.has(paneId)) {
-            el.remove();
-            _lastOutputHtml.delete(paneId);
-        }
-    }
-
-    // Remove placeholder if present
-    const placeholder = grid.querySelector("#grid-placeholder");
-    if (placeholder) placeholder.remove();
-
-    // Add or update panes
-    for (const inst of instances) {
-        const lines = capturedOutput[inst.pane_id] || [];
-        const outputHtml = ansiToHtml(lines.join("\n"));
-        const cwdBasename = inst.cwd.split("/").pop() || inst.cwd;
-        const isFocused = focusedPaneId === inst.pane_id;
-
-        let paneEl = existingPanes.get(inst.pane_id);
-        if (!paneEl) {
-            paneEl = document.createElement("div");
-            paneEl.className = `terminal-pane${isFocused ? " focused" : ""}`;
-            paneEl.dataset.paneId = inst.pane_id;
-            paneEl.dataset.userNumber = String(inst.user_number);
-            paneEl.addEventListener("click", () => {
-                setFocusedPane(inst.pane_id);
-            });
-            paneEl.innerHTML = `
-                <div class="pane-header">
-                    <span class="pane-number">${escapeHtml(String(inst.user_number))}</span>
-                    <span class="pane-label">CC #${escapeHtml(String(inst.user_number))}</span>
-                    <span class="pane-id">${escapeHtml(inst.pane_id)}</span>
-                    <span class="pane-cwd" title="${escapeHtml(inst.cwd)}">${escapeHtml(cwdBasename)}</span>
-                </div>
-                <div class="pane-output">${outputHtml}</div>`;
-            grid.appendChild(paneEl);
-        } else {
-            // Update existing pane — skip DOM write if output unchanged
-            paneEl.className = `terminal-pane${isFocused ? " focused" : ""}`;
-            const outputEl = paneEl.querySelector(".pane-output");
-            if (outputEl && outputHtml !== _lastOutputHtml.get(inst.pane_id)) {
-                const wasScrolledToBottom = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight < 20;
-                _lastOutputHtml.set(inst.pane_id, outputHtml);
-                outputEl.innerHTML = outputHtml;
-                if (wasScrolledToBottom) {
-                    outputEl.scrollTop = outputEl.scrollHeight;
-                }
-            }
-            // Update header fields that may change
-            const cwdEl = paneEl.querySelector(".pane-cwd");
-            if (cwdEl) {
-                cwdEl.textContent = cwdBasename;
-                cwdEl.title = inst.cwd;
-            }
-        }
-    }
-}
+/* ── Focused Pane Management ──────────────────────────────── */
 
 /**
  * Set focused pane by ID and update visual state.
+ * Focuses the xterm instance so keyboard input goes to it.
  * @param {string} paneId
  */
 function setFocusedPane(paneId) {
     focusedPaneId = paneId;
     for (const el of document.querySelectorAll(".terminal-pane")) {
         el.classList.toggle("focused", el.dataset.paneId === paneId);
+    }
+    // Focus the xterm instance
+    const managed = terminals.get(paneId);
+    if (managed) {
+        managed.xterm.focus();
     }
 }
 
@@ -320,9 +661,23 @@ function setFocusedPane(paneId) {
  * @param {number} number
  */
 function focusPaneByNumber(number) {
-    const paneEl = document.querySelector(`.terminal-pane[data-user-number="${number}"]`);
-    if (paneEl) {
-        setFocusedPane(paneEl.dataset.paneId);
+    const paneId = numberToPaneId.get(number);
+    if (paneId) {
+        setFocusedPane(paneId);
+    }
+}
+
+/**
+ * Unfocus the current terminal so global shortcuts work.
+ */
+function unfocusTerminal() {
+    focusedPaneId = null;
+    for (const el of document.querySelectorAll(".terminal-pane")) {
+        el.classList.remove("focused");
+    }
+    // Blur any focused xterm
+    for (const managed of terminals.values()) {
+        managed.xterm.blur();
     }
 }
 
@@ -487,17 +842,30 @@ function renderEventLog(events) {
 /* ── Status Bar ────────────────────────────────────────────── */
 
 /**
+ * Update the terminal count in the status bar.
+ */
+function updateTerminalCount() {
+    const alive = Array.from(terminals.values()).filter(t => !t.dead).length;
+    const total = terminals.size;
+    const label = total === 0
+        ? "0 terminals"
+        : alive === total
+            ? `${total} terminal${total !== 1 ? "s" : ""}`
+            : `${alive}/${total} terminals`;
+
+    updateStatusItem("status-instances", label,
+        alive > 0 ? "dot-green" : "dot-dim");
+}
+
+/**
  * Render the status bar with counts and health info.
  * @param {object} snap
  */
 function renderStatusBar(snap) {
-    const instanceCount = snap.instances ? snap.instances.length : 0;
     const eventCount = snap.recent_events ? snap.recent_events.length : 0;
     const planCount = snap.soul_state && snap.soul_state.plan ? snap.soul_state.plan.length : 0;
     const blockerCount = snap.soul_state && snap.soul_state.blockers ? snap.soul_state.blockers.length : 0;
 
-    updateStatusItem("status-instances", `${instanceCount} instance${instanceCount !== 1 ? "s" : ""}`,
-        instanceCount > 0 ? "dot-green" : "dot-dim");
     updateStatusItem("status-events", `${eventCount} events`, "dot-cyan");
     updateStatusItem("status-plan", `${planCount} plan items`, "dot-blue");
 
@@ -720,12 +1088,35 @@ function renderVoiceLog() {
 
 function initKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
+        // When a terminal is focused, only intercept global shortcuts with modifiers
+        const terminalFocused = focusedPaneId !== null && document.activeElement &&
+            document.activeElement.closest(".xterm");
+
+        if (terminalFocused) {
+            // Escape unfocuses the terminal so other shortcuts work
+            if (e.key === "Escape") {
+                e.preventDefault();
+                unfocusTerminal();
+                return;
+            }
+            // Let all other keys pass through to xterm when terminal is focused
+            return;
+        }
+
         // Don't intercept when typing in an input
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
 
         const key = e.key.toLowerCase();
 
         switch (key) {
+            case "n":
+                e.preventDefault();
+                spawnTerminal();
+                break;
+            case "w":
+                e.preventDefault();
+                if (focusedPaneId) killTerminal(focusedPaneId);
+                break;
             case "r":
                 e.preventDefault();
                 forceRefresh();
@@ -763,7 +1154,7 @@ async function forceRefresh() {
             lastSnapshot = result;
             renderAll(result);
         }
-    } catch (err) {
+    } catch {
         // Refresh failed silently — next poll cycle will update
     }
 }
@@ -826,4 +1217,27 @@ function formatUptime(seconds) {
 document.addEventListener("DOMContentLoaded", () => {
     initVoiceControls();
     initKeyboardShortcuts();
+
+    // Handle window resize — refit all terminals (debounced to avoid
+    // flooding the backend with resize_terminal calls during drag)
+    let resizeTimer = null;
+    function debouncedRefit() {
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(refitAllTerminals, 100);
+    }
+
+    window.addEventListener("resize", debouncedRefit);
+
+    // Observe grid layout changes for terminal refitting
+    const grid = document.getElementById("terminal-grid");
+    if (grid) {
+        const resizeObserver = new ResizeObserver(debouncedRefit);
+        resizeObserver.observe(grid);
+    }
+
+    // New terminal button
+    const newTermBtn = document.getElementById("new-terminal-btn");
+    if (newTermBtn) {
+        newTermBtn.addEventListener("click", () => spawnTerminal());
+    }
 });

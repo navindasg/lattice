@@ -161,6 +161,29 @@ body {
     -webkit-app-region: no-drag;
 }
 
+.title-action-btn {
+    background: var(--bg-overlay);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    font-size: 16px;
+    font-weight: 600;
+    width: 24px;
+    height: 24px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition-fast);
+    -webkit-app-region: no-drag;
+}
+
+.title-action-btn:hover {
+    background: var(--brand-primary);
+    border-color: var(--brand-primary);
+    color: white;
+}
+
 .health-dot {
     width: 8px;
     height: 8px;
@@ -611,6 +634,8 @@ body {
     background: var(--border-subtle);
     min-height: 0;
     overflow: hidden;
+    /* Rows auto-fill evenly so top and bottom rows are equal height */
+    grid-auto-rows: 1fr;
 }
 
 .placeholder {
@@ -651,6 +676,7 @@ body {
     background: var(--bg-base);
     overflow: hidden;
     min-height: 0;
+    position: relative;
 }
 
 .terminal-pane.focused {
@@ -689,6 +715,22 @@ body {
     font-size: 10px;
 }
 
+.pane-status-indicator {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.pane-status-alive {
+    background: var(--dot-active);
+    box-shadow: 0 0 4px var(--dot-active);
+}
+
+.pane-status-dead {
+    background: var(--text-muted);
+}
+
 .pane-cwd {
     color: var(--text-secondary);
     font-size: 11px;
@@ -699,18 +741,64 @@ body {
     max-width: 200px;
 }
 
-.pane-output {
+.pane-close-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    flex-shrink: 0;
+    transition: color var(--transition-fast);
+}
+
+.pane-close-btn:hover {
+    color: var(--color-error);
+}
+
+/* xterm.js container — fills the pane below the header */
+.xterm-container {
     flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: var(--space-sm) var(--space-md);
-    font-family: "SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace;
-    font-size: 12px;
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: var(--text-primary);
     min-height: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.xterm-container .xterm {
+    height: 100%;
+    padding: var(--space-xs) var(--space-sm);
+}
+
+.xterm-container .xterm-viewport {
+    overflow-y: auto !important;
+}
+
+/* Dead terminal overlay */
+.dead-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 17, 23, 0.75);
+    z-index: 10;
+    pointer-events: none;
+}
+
+.dead-overlay.hidden {
+    display: none;
+}
+
+.dead-text {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: var(--bg-elevated);
+    padding: var(--space-sm) var(--space-lg);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-default);
 }
 
 

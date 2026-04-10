@@ -63,31 +63,73 @@ def orchestrator_init(ctx: click.Context, as_json: bool, soul_dir: str | None) -
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--soul-dir", default=None, help="Override soul directory path")
 @click.option("--db-path", default=".lattice/orchestrator.duckdb", help="DuckDB path")
+@click.option(
+    "--initial-task",
+    default=None,
+    help="Task to inject into the agent event loop on startup.",
+)
+@click.option(
+    "--with-dashboard",
+    is_flag=True,
+    default=False,
+    help="Launch native desktop dashboard sharing the orchestrator's terminals.",
+)
+@click.option(
+    "--cols",
+    default=3,
+    type=click.IntRange(1, 9),
+    help="Dashboard grid columns (1-9, default: 3).",
+)
+@click.option(
+    "--tickets-dir",
+    default=None,
+    help="Directory of .md ticket files — spawns one CC instance per ticket on startup.",
+)
 @click.pass_context
 def orchestrator_start(
     ctx: click.Context,
     as_json: bool,
     soul_dir: str | None,
     db_path: str,
+    initial_task: str | None,
+    with_dashboard: bool,
+    cols: int,
+    tickets_dir: str | None,
 ) -> None:
     """Start the orchestrator: event server, agent, terminal detection.
 
     Runs the full startup sequence and enters the event loop. Exits on
     Ctrl+C or SIGTERM with graceful shutdown.
+
+    With --with-dashboard, also opens the native desktop dashboard
+    sharing the same terminal backend so spawned CC instances appear
+    in the xterm.js grid.
     """
     from lattice.orchestrator.runner import OrchestratorRunner
 
-    project_root = str(Path.cwd())
+    # Derive project root from soul_dir (two levels up from .lattice/soul/).
+    # Can't rely on CWD because `uv run --directory` changes it to repo root.
+    if soul_dir and Path(soul_dir).is_absolute():
+        project_root = str(Path(soul_dir).parent.parent)
+    else:
+        project_root = str(Path.cwd())
 
     runner = OrchestratorRunner(
         project_root=project_root,
         db_path=db_path,
         soul_dir=soul_dir or ".lattice/soul",
         voice_enabled=False,
+        initial_task=initial_task,
+        tickets_dir=tickets_dir,
+        dashboard=with_dashboard,
+        dashboard_columns=cols,
     )
 
     try:
-        asyncio.run(runner.run())
+        if with_dashboard:
+            runner.run_with_dashboard()
+        else:
+            asyncio.run(runner.run())
     except SystemExit as exc:
         if as_json:
             click.echo(json.dumps({"success": False, "error": str(exc)}))

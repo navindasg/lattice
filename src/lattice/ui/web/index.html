@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lattice Dashboard</title>
+    <link rel="stylesheet" href="vendor/xterm/xterm.css">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -15,6 +16,7 @@
             <span class="title-subtitle">orchestrator control plane</span>
         </div>
         <div class="title-bar-actions">
+            <button id="new-terminal-btn" class="title-action-btn" title="New Terminal (N)">+</button>
             <span id="health-indicator" class="health-dot health-disconnected" title="Disconnected"></span>
         </div>
     </header>
@@ -72,8 +74,8 @@
             <div id="terminal-grid">
                 <div id="grid-placeholder" class="placeholder">
                     <div class="placeholder-icon">&#x1F4BB;</div>
-                    <div class="placeholder-text">No CC instances detected</div>
-                    <div class="placeholder-hint">Start Claude Code in a tmux session to see terminals here</div>
+                    <div class="placeholder-text">No terminals running</div>
+                    <div class="placeholder-hint">Press <kbd>N</kbd> or click <strong>+</strong> to open a terminal</div>
                 </div>
             </div>
         </main>
@@ -84,7 +86,7 @@
         <div class="status-left">
             <span class="status-item" id="status-instances">
                 <span class="status-dot dot-dim"></span>
-                <span>0 instances</span>
+                <span>0 terminals</span>
             </span>
             <span class="status-separator">|</span>
             <span class="status-item" id="status-events">
@@ -114,17 +116,22 @@
         <div class="overlay-content">
             <h3>Keyboard Shortcuts</h3>
             <div class="shortcut-grid">
+                <div class="shortcut"><kbd>N</kbd><span>New terminal</span></div>
                 <div class="shortcut"><kbd>R</kbd><span>Refresh</span></div>
                 <div class="shortcut"><kbd>T</kbd><span>Focus text input</span></div>
                 <div class="shortcut"><kbd>V</kbd><span>Toggle mic</span></div>
-                <div class="shortcut"><kbd>1-9</kbd><span>Focus CC pane</span></div>
+                <div class="shortcut"><kbd>1-9</kbd><span>Focus terminal pane</span></div>
+                <div class="shortcut"><kbd>W</kbd><span>Close focused terminal</span></div>
                 <div class="shortcut"><kbd>?</kbd><span>Toggle shortcuts</span></div>
-                <div class="shortcut"><kbd>Esc</kbd><span>Close overlay</span></div>
+                <div class="shortcut"><kbd>Esc</kbd><span>Unfocus terminal</span></div>
             </div>
             <button class="overlay-close" onclick="document.getElementById('shortcuts-overlay').classList.add('hidden')">&times;</button>
         </div>
     </div>
 
+    <script src="vendor/xterm/xterm.min.js"></script>
+    <script src="vendor/xterm/addon-fit.min.js"></script>
+    <script src="vendor/xterm/addon-web-links.min.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

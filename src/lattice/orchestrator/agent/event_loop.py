@@ -28,8 +28,9 @@ from lattice.orchestrator.soul_ecosystem.writer import SoulWriter
 
 logger = structlog.get_logger(__name__)
 
-# Maximum time to process a single event before timing out
-_EVENT_PROCESSING_TIMEOUT = 10.0
+# Maximum time to process a single event before timing out.
+# Must be generous enough for cc_spawn (PTY spawn + 2s init delay + LLM calls).
+_EVENT_PROCESSING_TIMEOUT = 120.0
 
 
 class AgentEventLoop:
@@ -54,6 +55,7 @@ class AgentEventLoop:
         approval_submit: Any | None = None,
         thread_id: str = "orchestrator",
         shutdown_event: asyncio.Event | None = None,
+        project_root: str | None = None,
     ) -> None:
         self._graph = graph
         self._event_queue = event_queue
@@ -62,6 +64,7 @@ class AgentEventLoop:
         self._approval_submit = approval_submit
         self._thread_id = thread_id
         self._shutdown_event = shutdown_event or asyncio.Event()
+        self._project_root = project_root
         self._event_count = 0
         self._instance_events: dict[str, list[dict[str, Any]]] = {}
 
@@ -90,6 +93,23 @@ class AgentEventLoop:
                     timeout=2.0,
                 )
             except asyncio.TimeoutError:
+                continue
+
+            # Filter: skip events from CC instances outside our project.
+            # Synthetic events (voice commands) use session_id="voice-command"
+            # and have no CWD — always accept those.
+            if (
+                self._project_root
+                and event.cwd
+                and event.session_id != "voice-command"
+                and not event.cwd.startswith(self._project_root)
+            ):
+                logger.debug(
+                    "agent_event_loop.filtered",
+                    session_id=event.session_id[:8],
+                    cwd=event.cwd,
+                    project_root=self._project_root,
+                )
                 continue
 
             try:
@@ -198,6 +218,9 @@ class AgentEventLoop:
             if len(input_summary) > 500:
                 input_summary = input_summary[:500] + "..."
             parts.append(f"Input: {input_summary}")
+
+        if event.tool_response:
+            parts.append(f"Message: {event.tool_response}")
 
         if event.cwd:
             parts.append(f"CWD: {event.cwd}")
