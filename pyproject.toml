@@ -36,6 +36,7 @@ dependencies = [
     "textual>=3.0",
     "httpx>=0.24",
     "pywebview>=5.0",
+    "deepagents>=0.5.1",
 ]
 
 [project.scripts]

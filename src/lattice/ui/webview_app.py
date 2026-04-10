@@ -91,6 +91,7 @@ class DashboardAPI:
         self._pipeline: Any | None = None
         self._window: webview.Window | None = None
         self._pty_manager: PTYManager | None = None
+        self._runner: Any | None = None  # OrchestratorRunner for command injection
 
     def _init_pty_manager(self) -> None:
         """Initialize the PTYManager with output/exit callbacks wired
@@ -324,10 +325,25 @@ class DashboardAPI:
     # ------------------------------------------------------------------
 
     def send_text_command(self, text: str) -> str:
-        """Process a text command through the voice pipeline.
+        """Inject a text command into the orchestrator agent's event queue.
 
-        Returns JSON with action, detail, and success keys.
+        The command is delivered as a synthetic TaskAssignment event so
+        the agent can reason about it and call cc_send/cc_spawn/etc.
+
+        Falls back to the voice pipeline if no runner is wired.
+
+        Returns JSON with success status.
         """
+        # Primary path: inject directly into the agent event queue
+        if self._runner is not None:
+            success = self._runner.inject_text_command(text)
+            return json.dumps({
+                "success": success,
+                "action": "injected" if success else "not_ready",
+                "detail": text if success else "Agent event queue not ready yet",
+            })
+
+        # Fallback: voice pipeline (standalone dashboard without orchestrator)
         if self._loop is None:
             return json.dumps({"error": "Event loop not ready"})
         future = asyncio.run_coroutine_threadsafe(
@@ -405,7 +421,40 @@ class DashboardAPI:
                 stt = self._pipeline._ensure_stt()
                 stt._ensure_loaded()
 
+            # When the orchestrator runner is wired, do STT-only and
+            # inject the raw transcript into the agent event queue.
+            # The IntentRouter pipeline is for standalone dashboard use;
+            # with the orchestrator running, the agent should handle
+            # all reasoning about what to do with the voice command.
+            if self._runner is not None:
+                stt = self._pipeline._ensure_stt()
+                stt_result = stt.transcribe(audio)
+                # STT returns (text, confidence) tuple or just a string
+                transcript = stt_result[0] if isinstance(stt_result, tuple) else stt_result
+                if not transcript:
+                    return json.dumps({
+                        "success": False,
+                        "action": "empty_transcript",
+                        "detail": "Could not transcribe audio",
+                        "transcript": "",
+                    })
+
+                injected = self._runner.inject_text_command(transcript)
+                log.info(
+                    "stop_recording.injected",
+                    transcript=transcript[:100],
+                    injected=injected,
+                )
+                return json.dumps({
+                    "success": injected,
+                    "action": "injected" if injected else "not_ready",
+                    "detail": transcript if injected else "Agent event queue not ready",
+                    "transcript": transcript,
+                })
+
+            # Fallback: full voice pipeline (standalone dashboard)
             result = self._pipeline.process_audio(audio)
+            transcript = result.data.get("transcript", "")
 
             # Complete async mapper dispatch if needed
             if result.action == "mapper_dispatch_pending" and self._loop is not None:
@@ -415,7 +464,6 @@ class DashboardAPI:
                 )
                 result = future.result(timeout=30.0)
 
-            transcript = result.data.get("transcript", "")
             return json.dumps({
                 "success": result.success,
                 "action": result.action,

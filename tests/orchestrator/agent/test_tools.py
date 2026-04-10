@@ -12,6 +12,7 @@ import pytest
 
 from lattice.orchestrator.agent.tools import (
     ALL_TOOLS,
+    CUSTOM_TOOLS,
     ToolContext,
     cc_approve,
     cc_deny,
@@ -22,10 +23,10 @@ from lattice.orchestrator.agent.tools import (
     get_tool_context,
     github_read,
     map_query,
+    map_refresh,
     set_tool_context,
     soul_read,
     soul_update,
-    write_todos,
 )
 from lattice.orchestrator.soul_ecosystem.models import (
     InstanceAssignment,
@@ -118,14 +119,18 @@ class TestToolRegistry:
             assert tool_fn.name, f"Tool missing name: {tool_fn}"
 
     def test_expected_tool_names(self) -> None:
-        """All 11 expected tools are present."""
+        """All 11 expected tools are present (map_refresh replaces write_todos)."""
         names = {t.name for t in ALL_TOOLS}
         expected = {
             "cc_send", "cc_approve", "cc_deny", "cc_status",
             "cc_spawn", "cc_interrupt", "github_read",
-            "soul_read", "soul_update", "map_query", "write_todos",
+            "soul_read", "soul_update", "map_query", "map_refresh",
         }
         assert names == expected
+
+    def test_custom_tools_matches_all_tools(self) -> None:
+        """CUSTOM_TOOLS is the same as ALL_TOOLS."""
+        assert CUSTOM_TOOLS is ALL_TOOLS
 
 
 class TestToolContext:
@@ -314,16 +319,21 @@ class TestMapQuery:
         assert "No shadow root" in result["error"]
 
 
-class TestWriteTodos:
-    def test_updates_plan_section(
-        self, tool_ctx: ToolContext, mock_soul_writer: MagicMock
+class TestMapRefresh:
+    def test_returns_success_with_valid_dir(
+        self, tool_ctx: ToolContext, tmp_path: Path
     ) -> None:
-        tasks = ["Fix auth bug", "Write tests", "Deploy to staging"]
-        result = write_todos.invoke({"tasks": tasks})
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = map_refresh.invoke({"project_dir": str(tmp_path)})
         assert result["success"] is True
-        assert result["task_count"] == 3
-        mock_soul_writer.update_state.assert_called_once()
-        call_args = mock_soul_writer.update_state.call_args
-        assert call_args[0][0] == "Plan"
-        assert "Fix auth bug" in call_args[0][1]
-        assert "Write tests" in call_args[0][1]
+        assert result["project_dir"] == str(tmp_path)
+
+    def test_returns_error_on_timeout(
+        self, tool_ctx: ToolContext, tmp_path: Path
+    ) -> None:
+        import subprocess
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 120)):
+            result = map_refresh.invoke({"project_dir": str(tmp_path)})
+        assert result["success"] is False
+        assert "timed out" in result["error"]

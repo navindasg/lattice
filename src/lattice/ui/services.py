@@ -70,11 +70,12 @@ class DashboardService:
         self,
         soul_dir: Path,
         sock_path: Path | None = None,
+        terminal_backend: Any | None = None,
     ) -> None:
         self._soul_dir = soul_dir
         self._sock_path = sock_path or _DEFAULT_SOCK_PATH
         self._reader = SoulReader(soul_dir)
-        self._backend: Any | None = None
+        self._backend: Any | None = terminal_backend
         self._http: httpx.AsyncClient | None = None
 
     async def initialize(self) -> None:
@@ -103,6 +104,8 @@ class DashboardService:
             # libtmux reads sys.stdout.encoding at import time, which
             # fails under Textual's _PrintCapture wrapper on the main
             # thread.  Running in the executor avoids this.
+            # Skipped when a terminal_backend was injected at construction
+            # (e.g. --with-dashboard provides a shared PTYBackend).
             def _init_tmux():
                 from lattice.orchestrator.terminal.tmux import TmuxBackend
                 return TmuxBackend()
@@ -112,6 +115,8 @@ class DashboardService:
                 self._backend = await loop.run_in_executor(None, _init_tmux)
             except (RuntimeError, AttributeError):
                 log.warning("dashboard_service.no_tmux")
+        else:
+            log.info("dashboard_service.backend_injected", backend=type(self._backend).__name__)
 
     async def close(self) -> None:
         """Close HTTP client and release resources."""

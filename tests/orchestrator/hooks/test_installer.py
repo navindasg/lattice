@@ -36,6 +36,17 @@ from lattice.orchestrator.hooks.installer import (
 from lattice.orchestrator.hooks.models import HookDefinition
 
 
+def _get_hook_command(hook_entry: dict) -> str:
+    """Extract the command string from a hook entry.
+
+    Handles the CC hook format: { "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }
+    """
+    hooks_array = hook_entry.get("hooks", [])
+    if hooks_array and isinstance(hooks_array, list):
+        return hooks_array[0].get("command", "")
+    return hook_entry.get("command", "")
+
+
 @pytest.fixture
 def tmp_settings(tmp_path: Path) -> Path:
     """Return path to a temporary settings.json (does not exist yet)."""
@@ -161,13 +172,14 @@ class TestFreshInstall:
     def test_pre_tool_use_is_synchronous(
         self, installer: HookInstaller, tmp_settings: Path
     ) -> None:
-        """PreToolUse hook entry has no 'async' key and has 'timeout'."""
+        """PreToolUse hook command has no 'async' key and has 'timeout'."""
         installer.install()
         settings = json.loads(tmp_settings.read_text())
         pre_tool_hooks = settings["hooks"]["PreToolUse"]
         lattice_hook = next(h for h in pre_tool_hooks if _is_lattice_hook(h))
-        assert "async" not in lattice_hook
-        assert lattice_hook["timeout"] == 30000  # 30s in ms
+        hook_cmd = lattice_hook["hooks"][0]
+        assert "async" not in hook_cmd
+        assert hook_cmd["timeout"] == 30000  # 30s in ms
 
     def test_async_hooks_have_async_flag(
         self, installer: HookInstaller, tmp_settings: Path
@@ -180,7 +192,8 @@ class TestFreshInstall:
                 continue
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert lattice_hook.get("async") is True, (
+            hook_cmd = lattice_hook["hooks"][0]
+            assert hook_cmd.get("async") is True, (
                 f"{event_type} should have async=True"
             )
 
@@ -193,7 +206,7 @@ class TestFreshInstall:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert LATTICE_HOOK_MARKER in lattice_hook["command"]
+            assert LATTICE_HOOK_MARKER in _get_hook_command(lattice_hook)
 
     def test_hook_commands_contain_spool_fallback(
         self, installer: HookInstaller, tmp_settings: Path, tmp_spool: Path
@@ -204,7 +217,7 @@ class TestFreshInstall:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert str(tmp_spool) in lattice_hook["command"]
+            assert str(tmp_spool) in _get_hook_command(lattice_hook)
 
     def test_result_settings_path(self, installer: HookInstaller, tmp_settings: Path) -> None:
         """Install result includes the settings path."""
@@ -528,7 +541,7 @@ class TestHookPayloadContent:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert "SESSION_ID" in lattice_hook["command"]
+            assert "SESSION_ID" in _get_hook_command(lattice_hook)
 
     def test_payload_includes_tool_name(
         self, installer: HookInstaller, tmp_settings: Path
@@ -538,7 +551,7 @@ class TestHookPayloadContent:
         settings = json.loads(tmp_settings.read_text())
         pre_tool = settings["hooks"]["PreToolUse"]
         lattice_hook = next(h for h in pre_tool if _is_lattice_hook(h))
-        assert "TOOL_NAME" in lattice_hook["command"]
+        assert "TOOL_NAME" in _get_hook_command(lattice_hook)
 
     def test_payload_includes_timestamp(
         self, installer: HookInstaller, tmp_settings: Path
@@ -549,7 +562,7 @@ class TestHookPayloadContent:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert "timestamp" in lattice_hook["command"]
+            assert "timestamp" in _get_hook_command(lattice_hook)
 
     def test_payload_includes_cwd(
         self, installer: HookInstaller, tmp_settings: Path
@@ -560,7 +573,7 @@ class TestHookPayloadContent:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert "CWD" in lattice_hook["command"]
+            assert "CWD" in _get_hook_command(lattice_hook)
 
     def test_payload_includes_transcript_path(
         self, installer: HookInstaller, tmp_settings: Path
@@ -571,4 +584,4 @@ class TestHookPayloadContent:
         for event_type in HOOK_EVENT_TYPES:
             hooks = settings["hooks"][event_type]
             lattice_hook = next(h for h in hooks if _is_lattice_hook(h))
-            assert "TRANSCRIPT_PATH" in lattice_hook["command"]
+            assert "TRANSCRIPT_PATH" in _get_hook_command(lattice_hook)

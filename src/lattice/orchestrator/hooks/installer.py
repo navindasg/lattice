@@ -115,7 +115,8 @@ def _is_lattice_hook(hook_entry: dict) -> bool:
     """Check if a hook entry was installed by Lattice.
 
     Identifies Lattice hooks by the presence of LATTICE_HOOK_MARKER
-    in the command string.
+    in any command string. Handles both the new format (matcher + hooks
+    array) and legacy flat format.
 
     Args:
         hook_entry: A hook dict from settings.json.
@@ -123,6 +124,14 @@ def _is_lattice_hook(hook_entry: dict) -> bool:
     Returns:
         True if this is a Lattice-managed hook.
     """
+    # New format: { "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }
+    hooks_array = hook_entry.get("hooks", [])
+    if isinstance(hooks_array, list):
+        for h in hooks_array:
+            if isinstance(h, dict) and LATTICE_HOOK_MARKER in h.get("command", ""):
+                return True
+
+    # Legacy flat format: { "command": "..." }
     command = hook_entry.get("command", "")
     return LATTICE_HOOK_MARKER in command
 
@@ -310,23 +319,41 @@ class HookInstaller:
     def _build_hook_entry(self, hook_def: HookDefinition) -> dict:
         """Build a single hook entry dict for settings.json.
 
+        Claude Code hook format requires a matcher + hooks array::
+
+            {
+                "matcher": "",
+                "hooks": [
+                    { "type": "command", "command": "...", "timeout": 5000 }
+                ]
+            }
+
+        The ``matcher`` is empty string to match all tools. The ``hooks``
+        array contains the actual command definitions.
+
         Args:
             hook_def: The hook definition to build from.
 
         Returns:
-            Dict suitable for inclusion in the hooks list.
+            Dict suitable for inclusion in the event type's hooks list.
         """
         command = _build_hook_command(hook_def, self._sock_path, self._spool_path)
 
-        entry: dict = {"command": command}
+        hook_cmd: dict = {
+            "type": "command",
+            "command": command,
+        }
 
         if hook_def.is_async:
-            entry["async"] = True
+            hook_cmd["async"] = True
 
         if not hook_def.is_async:
-            entry["timeout"] = hook_def.timeout_seconds * 1000  # CC uses milliseconds
+            hook_cmd["timeout"] = hook_def.timeout_seconds * 1000  # CC uses milliseconds
 
-        return entry
+        return {
+            "matcher": "",
+            "hooks": [hook_cmd],
+        }
 
     def _read_settings(self) -> dict | None:
         """Read and parse CC settings.json.

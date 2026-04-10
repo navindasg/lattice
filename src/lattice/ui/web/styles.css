@@ -634,6 +634,8 @@ body {
     background: var(--border-subtle);
     min-height: 0;
     overflow: hidden;
+    /* Rows auto-fill evenly so top and bottom rows are equal height */
+    grid-auto-rows: 1fr;
 }
 
 .placeholder {

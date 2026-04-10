@@ -169,7 +169,7 @@ async function spawnTerminal(opts) {
         cursorBlink: true,
         cursorStyle: "block",
         fontFamily: '"SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace',
-        fontSize: 13,
+        fontSize: 10,
         lineHeight: 1.2,
         scrollback: 5000,
         theme: {
@@ -309,6 +309,151 @@ async function spawnTerminal(opts) {
 }
 
 /**
+ * Create an xterm.js pane for an externally-spawned terminal (e.g. via cc_spawn).
+ * Does NOT call spawn_terminal on the backend — the process already exists.
+ *
+ * @param {string} paneId - The backend pane_id to attach to.
+ * @returns {ManagedTerminal|null} The created managed terminal, or null on failure.
+ */
+function createTerminalPane(paneId) {
+    const grid = document.getElementById("terminal-grid");
+    if (!grid) return null;
+
+    // Remove placeholder if present
+    const placeholder = grid.querySelector("#grid-placeholder");
+    if (placeholder) placeholder.remove();
+
+    const userNumber = nextTerminalNumber;
+    const paneEl = document.createElement("div");
+    paneEl.className = "terminal-pane";
+    paneEl.dataset.paneId = paneId;
+    paneEl.dataset.userNumber = String(userNumber);
+
+    const header = document.createElement("div");
+    header.className = "pane-header";
+    header.innerHTML = `
+        <span class="pane-number">${userNumber}</span>
+        <span class="pane-label">CC #${userNumber}</span>
+        <span class="pane-status-indicator pane-status-alive"></span>
+        <span class="pane-cwd"></span>
+        <button class="pane-close-btn" title="Close terminal">&times;</button>
+    `;
+    paneEl.appendChild(header);
+
+    const termContainer = document.createElement("div");
+    termContainer.className = "xterm-container";
+    paneEl.appendChild(termContainer);
+
+    const deadOverlay = document.createElement("div");
+    deadOverlay.className = "dead-overlay hidden";
+    deadOverlay.innerHTML = `<span class="dead-text">[exited]</span>`;
+    paneEl.appendChild(deadOverlay);
+
+    grid.appendChild(paneEl);
+
+    const xterm = new Terminal({
+        cursorBlink: true,
+        cursorStyle: "block",
+        fontFamily: '"SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace',
+        fontSize: 10,
+        lineHeight: 1.2,
+        scrollback: 5000,
+        theme: {
+            background: "#0f1117",
+            foreground: "#e4e6ed",
+            cursor: "#4f8ff7",
+            cursorAccent: "#0f1117",
+            selectionBackground: "rgba(79, 143, 247, 0.3)",
+            selectionForeground: "#e4e6ed",
+            black: "#3b4048",
+            red: "#e55353",
+            green: "#3ecf71",
+            yellow: "#f5a623",
+            blue: "#4f8ff7",
+            magenta: "#c084fc",
+            cyan: "#59c9e8",
+            white: "#e4e6ed",
+            brightBlack: "#5c6070",
+            brightRed: "#ff7070",
+            brightGreen: "#5eff8a",
+            brightYellow: "#ffc44c",
+            brightBlue: "#80b5ff",
+            brightMagenta: "#dda0ff",
+            brightCyan: "#7ee0f5",
+            brightWhite: "#ffffff",
+        },
+        allowProposedApi: true,
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+
+    try {
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        xterm.loadAddon(webLinksAddon);
+    } catch {
+        // optional
+    }
+
+    xterm.open(termContainer);
+    requestAnimationFrame(() => fitAddon.fit());
+
+    const managed = {
+        xterm,
+        fitAddon,
+        container: paneEl,
+        paneId,
+        dead: false,
+        exitCode: null,
+        userNumber,
+    };
+    terminals.set(paneId, managed);
+    numberToPaneId.set(userNumber, paneId);
+    nextTerminalNumber++;
+
+    // Wire keyboard input → backend
+    xterm.onData((data) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(data);
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    xterm.onBinary((data) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        const bytes = new Uint8Array(data.length);
+        for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i);
+        const b64 = bytesToBase64(bytes);
+        window.pywebview.api.write_terminal(paneId, b64).catch(() => {});
+    });
+
+    xterm.onResize(({ cols, rows }) => {
+        if (managed.dead) return;
+        if (!window.pywebview || !window.pywebview.api) return;
+        window.pywebview.api.resize_terminal(paneId, cols, rows).catch(() => {});
+    });
+
+    paneEl.addEventListener("click", (e) => {
+        if (e.target.closest(".pane-close-btn")) return;
+        setFocusedPane(paneId);
+    });
+
+    const closeBtn = paneEl.querySelector(".pane-close-btn");
+    if (closeBtn) {
+        closeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            killTerminal(paneId);
+        });
+    }
+
+    updateTerminalCount();
+    return managed;
+}
+
+/**
  * Kill a terminal and remove it from the grid.
  * @param {string} paneId
  */
@@ -377,8 +522,14 @@ function showGridPlaceholder() {
  * @param {string} b64Data - Base64-encoded output bytes.
  */
 window.__terminalOutput = function(paneId, b64Data) {
-    const managed = terminals.get(paneId);
-    if (!managed) return;
+    let managed = terminals.get(paneId);
+
+    // Auto-create xterm instance for terminals spawned by the orchestrator
+    // (e.g. via cc_spawn) that the frontend doesn't know about yet
+    if (!managed) {
+        managed = createTerminalPane(paneId);
+        if (!managed) return;
+    }
 
     managed.xterm.write(base64ToBytes(b64Data));
 };
@@ -447,9 +598,6 @@ window.__latticeInit = function(cfg) {
         modeEl.textContent = cfg.interactive ? "interactive" : "read-only";
     }
     applyGridColumns(cfg.columns);
-
-    // Auto-spawn a default terminal on first load
-    spawnTerminal();
 };
 
 /**

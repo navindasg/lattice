@@ -68,6 +68,7 @@ class TerminalInfo:
     cols: int
     rows: int
     created_at: float
+    last_output_at: float | None = None
 
 
 class _Terminal:
@@ -89,6 +90,7 @@ class _Terminal:
         "cols",
         "rows",
         "created_at",
+        "last_output_at",
         "_stop_event",
     )
 
@@ -115,6 +117,7 @@ class _Terminal:
         self.cols = cols
         self.rows = rows
         self.created_at = time.monotonic()
+        self.last_output_at: float | None = None
         self._stop_event = threading.Event()
 
     def to_info(self) -> TerminalInfo:
@@ -128,6 +131,7 @@ class _Terminal:
             cols=self.cols,
             rows=self.rows,
             created_at=self.created_at,
+            last_output_at=self.last_output_at,
         )
 
 
@@ -444,6 +448,8 @@ class PTYManager:
 
                 if not data:
                     break
+
+                term.last_output_at = time.monotonic()
 
                 if self._on_output is not None:
                     try:

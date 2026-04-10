@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import time
 from typing import Any
 
 import structlog
@@ -61,8 +62,13 @@ class PTYBackend(TerminalBackend):
         log.debug("pty_backend.send_text", pane_id=pane_id, length=len(text))
 
     async def send_enter(self, pane_id: str) -> None:
-        """Send Enter key (newline) to a terminal."""
-        await self._run(self._pty.write, pane_id, b"\n")
+        """Send Enter key (carriage return) to a terminal.
+
+        Physical Enter key sends \\r (CR), not \\n (LF). In raw terminal
+        mode (used by Claude CLI and most interactive CLIs), only \\r is
+        recognized as the Enter/submit action.
+        """
+        await self._run(self._pty.write, pane_id, b"\r")
         log.debug("pty_backend.send_enter", pane_id=pane_id)
 
     async def send_interrupt(self, pane_id: str) -> None:
@@ -112,23 +118,28 @@ class PTYBackend(TerminalBackend):
         cwd = None
         cmd_str = command
 
-        # Parse "cd /path && actual_command" pattern
+        # Parse "cd /path && actual_command" pattern only.
+        # Other uses of && are left intact and run via shell.
         if "&&" in command:
             parts = command.split("&&", 1)
             cd_part = parts[0].strip()
-            cmd_str = parts[1].strip()
             if cd_part.startswith("cd "):
                 raw_path = cd_part[3:].strip()
-                # Remove shell quoting
                 try:
                     cwd = shlex.split(raw_path)[0]
                 except ValueError:
                     cwd = raw_path.strip("'\"")
+                cmd_str = parts[1].strip()
 
-        try:
-            cmd_list = shlex.split(cmd_str)
-        except ValueError:
-            cmd_list = [cmd_str]
+        # If the command contains shell metacharacters, run via shell
+        shell_chars = {"&&", "||", "|", ";", ">", "<", "$", "`"}
+        if any(ch in cmd_str for ch in shell_chars):
+            cmd_list = ["/bin/sh", "-c", cmd_str]
+        else:
+            try:
+                cmd_list = shlex.split(cmd_str)
+            except ValueError:
+                cmd_list = [cmd_str]
 
         pane_id = await self._run(
             self._pty.spawn, cmd_list, cwd
@@ -187,8 +198,60 @@ class PTYBackend(TerminalBackend):
                 )
             )
 
-        log.debug("pty_backend.detect_cc_panes", count=len(instances))
+        # Only log when count changes to avoid health-monitor spam
+        if not hasattr(self, "_last_cc_count") or self._last_cc_count != len(instances):
+            log.debug("pty_backend.detect_cc_panes", count=len(instances))
+            self._last_cc_count = len(instances)
         return instances
+
+    async def wait_for_ready(
+        self,
+        pane_id: str,
+        timeout: float = 20.0,
+        quiet_period: float = 1.5,
+    ) -> bool:
+        """Wait until a terminal has produced output and settled.
+
+        Polls the terminal's last_output_at timestamp to detect when
+        the process has finished its initialization output (e.g. Claude
+        CLI banner) and is ready to accept input.
+
+        Args:
+            pane_id: Terminal to watch.
+            timeout: Max seconds to wait overall.
+            quiet_period: Seconds of no new output to consider "ready".
+
+        Returns:
+            True if the terminal is ready, False if timed out.
+        """
+        start = time.monotonic()
+        poll_interval = 0.3
+
+        while (time.monotonic() - start) < timeout:
+            info = await self._run(self._pty.get_terminal, pane_id)
+
+            if info.status != TerminalStatus.ALIVE:
+                log.warning("wait_for_ready.terminal_died", pane_id=pane_id)
+                return False
+
+            if info.last_output_at is not None:
+                elapsed_since_output = time.monotonic() - info.last_output_at
+                if elapsed_since_output >= quiet_period:
+                    log.info(
+                        "wait_for_ready.ready",
+                        pane_id=pane_id,
+                        wait_secs=round(time.monotonic() - start, 1),
+                    )
+                    return True
+
+            await asyncio.sleep(poll_interval)
+
+        log.warning(
+            "wait_for_ready.timeout",
+            pane_id=pane_id,
+            timeout=timeout,
+        )
+        return False
 
     def shutdown(self) -> None:
         """Shut down the underlying PTYManager."""

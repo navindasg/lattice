@@ -27,7 +27,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NUM_INSTANCES=6
-DASHBOARD=false
+DASHBOARD=true
+AUTO_TASK=false
 AUTO_SCORE=false
 TIMEOUT_MINS=30
 
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             NUM_INSTANCES="$2"; shift 2 ;;
         --dashboard)
             DASHBOARD=true; shift ;;
+        --no-dashboard)
+            DASHBOARD=false; shift ;;
+        --auto-task)
+            AUTO_TASK=true; shift ;;
         --auto-score)
             AUTO_SCORE=true; shift ;;
         --timeout)
@@ -110,6 +115,7 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
     err "ANTHROPIC_API_KEY is not set. Add it to $REPO_ROOT/.env or export it."
     exit 1
 fi
+export ANTHROPIC_API_KEY
 ok "ANTHROPIC_API_KEY is set (${#ANTHROPIC_API_KEY} chars)"
 
 # ---------------------------------------------------------------------------
@@ -131,6 +137,50 @@ fi
 ok "All prerequisites found"
 
 # ---------------------------------------------------------------------------
+# Step 0: Clean previous run state
+# ---------------------------------------------------------------------------
+info "Resetting previous run state..."
+
+# Kill any leftover orchestrator processes for this benchmark
+pkill -f "orchestrator:start.*miniapi" 2>/dev/null || true
+
+# Remove stale socket
+rm -f "$HOME/.lattice/orchestrator.sock"
+
+# Remove DuckDB checkpoints (stale agent conversation)
+rm -f "$SCRIPT_DIR/.lattice/orchestrator.duckdb" \
+      "$SCRIPT_DIR/.lattice/orchestrator.duckdb.wal"
+
+# Reset all machine-managed soul files to blank templates
+mkdir -p "$SCRIPT_DIR/.lattice/soul"
+cat > "$SCRIPT_DIR/.lattice/soul/STATE.md" << 'STATE_EOF'
+## Instances
+_No active instances_
+
+## Plan
+_No current plan_
+
+## Decisions
+_No recent decisions_
+
+## Blockers
+_No blockers_
+STATE_EOF
+
+cat > "$SCRIPT_DIR/.lattice/soul/MEMORY.md" << 'MEM_EOF'
+# Orchestrator Memory
+
+_Durable cross-session facts, preferences, and learned patterns._
+MEM_EOF
+
+# Also nuke any .lattice files outside soul/ (stale locks, caches)
+rm -rf "$SCRIPT_DIR/.lattice/orchestrator.duckdb" \
+       "$SCRIPT_DIR/.lattice/orchestrator.duckdb.wal" \
+       "$SCRIPT_DIR/.lattice/"*.lock 2>/dev/null || true
+
+ok "Previous run state cleaned"
+
+# ---------------------------------------------------------------------------
 # Step 1: Verify stubs
 # ---------------------------------------------------------------------------
 info "Verifying module stubs..."
@@ -149,7 +199,7 @@ ok "All module stubs present"
 # Step 2: Verify tests are RED
 # ---------------------------------------------------------------------------
 info "Verifying baseline (all tests should fail)..."
-if uv run pytest tests/ -q --tb=no 2>/dev/null; then
+if uv run pytest tests/ -q --tb=no &>/dev/null; then
     err "Tests are already passing! Reset stubs before running benchmark."
     exit 1
 fi
@@ -171,26 +221,37 @@ $LATTICE_CMD orchestrator:init --soul-dir "$SCRIPT_DIR/.lattice/soul" 2>/dev/nul
 ok "Soul ecosystem initialized"
 
 # ---------------------------------------------------------------------------
-# Step 5: Build task message
+# Step 4b: Install hooks (enables CC → orchestrator event reporting)
 # ---------------------------------------------------------------------------
-TASK_MSG="There are ${NUM_INSTANCES} tickets in the ${SCRIPT_DIR}/tickets/ directory. \
-Spawn ${NUM_INSTANCES} Claude Code instances and assign one ticket to each. \
-Each instance should read its ticket file and implement the module. \
-The project directory is ${SCRIPT_DIR}."
+info "Installing orchestrator hooks..."
+$LATTICE_CMD orchestrator:install-hooks 2>/dev/null || true
+ok "Hooks installed"
 
 # ---------------------------------------------------------------------------
-# Step 6: Start orchestrator with initial task (background, PTYBackend)
+# Step 5: Start orchestrator with tickets (+ optional dashboard)
 # ---------------------------------------------------------------------------
-info "Starting orchestrator with task assignment..."
+info "Starting orchestrator..."
 cd "$SCRIPT_DIR"
 
 # Clean up stale socket if present
 rm -f "$HOME/.lattice/orchestrator.sock"
 
-$LATTICE_CMD orchestrator:start \
-    --soul-dir "$SCRIPT_DIR/.lattice/soul" \
-    --db-path "$SCRIPT_DIR/.lattice/orchestrator.duckdb" \
-    --initial-task "$TASK_MSG" &
+# Build orchestrator command — blank slate, agent spawns via voice commands
+ORCH_ARGS=(
+    orchestrator:start
+    --soul-dir "$SCRIPT_DIR/.lattice/soul"
+    --db-path "$SCRIPT_DIR/.lattice/orchestrator.duckdb"
+)
+
+# When dashboard is requested, use --with-dashboard so the orchestrator
+# and dashboard share the same PTYManager (CC terminals appear in xterm.js)
+if [[ "$DASHBOARD" == "true" ]]; then
+    cols=$((NUM_INSTANCES < 3 ? NUM_INSTANCES : 3))
+    ORCH_ARGS+=(--with-dashboard --cols "$cols")
+    info "Dashboard will open with $cols columns"
+fi
+
+$LATTICE_CMD "${ORCH_ARGS[@]}" &
 ORCH_PID=$!
 
 # Give the orchestrator time to initialize and inject the task
@@ -204,21 +265,6 @@ if ! kill -0 "$ORCH_PID" 2>/dev/null; then
     exit 1
 fi
 ok "Orchestrator running (PID: $ORCH_PID) — task injected"
-
-# ---------------------------------------------------------------------------
-# Step 7: Dashboard (optional)
-# ---------------------------------------------------------------------------
-if [[ "$DASHBOARD" == "true" ]]; then
-    info "Launching native desktop dashboard..."
-    cols=$((NUM_INSTANCES < 3 ? NUM_INSTANCES : 3))
-    $LATTICE_CMD ui:dashboard \
-        --cols "$cols" \
-        --soul-dir "$SCRIPT_DIR/.lattice/soul" \
-        --interactive >/dev/null 2>&1 &
-    DASH_PID=$!
-    disown "$DASH_PID"
-    ok "Native dashboard window opened (PID: $DASH_PID)"
-fi
 
 # ---------------------------------------------------------------------------
 # Step 8: Status and wait
